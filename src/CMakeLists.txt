@@ -1430,13 +1430,19 @@ if( NOT WIN32 AND NOT APPLE )
 	endif()
 endif()
 
+if( APPLE )
+	set( SOUNDFONT_DEST_DIR "${CMAKE_BINARY_DIR}/${ZDOOM_EXE_NAME}.app/Contents/Resources" )
+else()
+	set( SOUNDFONT_DEST_DIR "$<TARGET_FILE_DIR:zdoom>" )
+endif()
+
 add_custom_command(TARGET zdoom POST_BUILD
 	COMMAND ${CMAKE_COMMAND} -E copy_if_different
-	${CMAKE_SOURCE_DIR}/soundfont/uzdoom.sf2 $<TARGET_FILE_DIR:zdoom>/soundfonts/uzdoom.sf2
+	${CMAKE_SOURCE_DIR}/soundfont/uzdoom.sf2 ${SOUNDFONT_DEST_DIR}/soundfonts/uzdoom.sf2
 	COMMAND ${CMAKE_COMMAND} -E copy_if_different
-	${CMAKE_SOURCE_DIR}/fm_banks/GENMIDI.GS.wopl $<TARGET_FILE_DIR:zdoom>/fm_banks/GENMIDI.GS.wopl
+	${CMAKE_SOURCE_DIR}/fm_banks/GENMIDI.GS.wopl ${SOUNDFONT_DEST_DIR}/fm_banks/GENMIDI.GS.wopl
 	COMMAND ${CMAKE_COMMAND} -E copy_if_different
-	${CMAKE_SOURCE_DIR}/fm_banks/gs-by-papiezak-and-sneakernets.wopn $<TARGET_FILE_DIR:zdoom>/fm_banks/gs-by-papiezak-and-sneakernets.wopn
+	${CMAKE_SOURCE_DIR}/fm_banks/gs-by-papiezak-and-sneakernets.wopn ${SOUNDFONT_DEST_DIR}/fm_banks/gs-by-papiezak-and-sneakernets.wopn
 )
 
 if ( NOT ZMUSIC_SYSTEM_INSTALL AND (NOT DEFINED BUILD_SHARED_LIBS OR BUILD_SHARED_LIBS))
