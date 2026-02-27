@@ -153,6 +153,19 @@ static int	CommandsAhead = 0;		// If too far ahead of the host, slow down to rem
 static int	SkipCommandTimer = 0;	// Tracker for when to check for skipping commands. ~0.5 seconds in a row of being ahead will start skipping.
 static int	SkipCommandAmount = 0;	// Amount of commands to skip. Try and batch skip them all at once since we won't be able to get an update until the full RTT.
 
+// Disconnect handshake state.
+static bool		bDisconnecting = false;		// Are we in the process of a graceful disconnect?
+static uint64_t	DisconnectTimestamp = 0;		// When we last sent a disconnect request/notify.
+static int		DisconnectRetries = 0;		// How many times we've retried the disconnect.
+static uint64_t	DisconnectConfirmMask = 0;	// Bitmask of clients that have confirmed our disconnect notification (host only).
+static bool		bMigrating = false;			// Is host migration in progress?
+static FMigrationState PendingMigrationState;	// State received from departing host during migration.
+static bool		bHasPendingMigration = false;	// True if we received migration state and are becoming the new host.
+
+constexpr int		DISCONNECT_TIMEOUT_MS = 500;	// Retry disconnect request/notify after this many ms.
+constexpr int		DISCONNECT_MAX_RETRIES = 8;		// Give up after this many retries (4 seconds total).
+constexpr uint64_t	CLIENT_TIMEOUT_MS = 10000;		// Treat client as disconnected after 10 seconds of silence.
+
 void D_ProcessEvents(void); 
 void G_BuildTiccmd(usercmd_t *cmd);
 void D_DoAdvanceDemo(void);
@@ -707,7 +720,29 @@ static void ClientConnecting(int client)
 	if (consoleplayer != Net_Arbitrator)
 		return;
 
-	// TODO: Eventually...
+	// Initialize network state for the joining client.
+	auto& state = ClientStates[client];
+	memset(&state, 0, sizeof(FClientNetState));
+	state.CurrentSequence = gametic / TicDup;
+	state.SequenceAck = gametic / TicDup;
+	state.CurrentNetConsistency = CurrentConsistency;
+	state.ConsistencyAck = CurrentConsistency;
+	state.LastVerifiedConsistency = CurrentConsistency;
+	state.Flags = CF_JOINING | CF_AWAITING_STATE;
+	state.LastPacketReceivedTime = I_msTime();
+
+	// Notify all other clients that a new player is joining.
+	uint8_t buf[4];
+	buf[0] = NCMD_SETUP;
+	buf[1] = PRE_MIDGAME_PLAYER_JOIN;
+	buf[2] = static_cast<uint8_t>(client);
+	for (auto c : NetworkClients)
+	{
+		if (c != consoleplayer && c != client)
+			I_SendSetupPacket(c, buf, 3);
+	}
+
+	Printf("Client %d is joining mid-game\n", client);
 }
 
 static void DisconnectClient(int clientNum)
@@ -758,6 +793,360 @@ static void ClientQuit(int clientNum, int newHost)
 	if (demorecording)
 		G_CheckDemoStatus();
 }
+
+// ---------------------------------------------------------------------------
+// Disconnect handshake helpers
+// ---------------------------------------------------------------------------
+
+static void SendSetupPacketToClient(int client, uint8_t subtype, const uint8_t* extra = nullptr, size_t extraSize = 0)
+{
+	uint8_t buf[MAX_MSGLEN];
+	buf[0] = NCMD_SETUP;
+	buf[1] = subtype;
+	size_t size = 2;
+	if (extra && extraSize > 0)
+	{
+		memcpy(&buf[2], extra, extraSize);
+		size += extraSize;
+	}
+	I_SendSetupPacket(client, buf, size);
+}
+
+static void SendSetupPacketToAll(uint8_t subtype, const uint8_t* extra = nullptr, size_t extraSize = 0, int excludeClient = -1)
+{
+	uint8_t buf[MAX_MSGLEN];
+	buf[0] = NCMD_SETUP;
+	buf[1] = subtype;
+	size_t size = 2;
+	if (extra && extraSize > 0)
+	{
+		memcpy(&buf[2], extra, extraSize);
+		size += extraSize;
+	}
+	for (auto client : NetworkClients)
+	{
+		if (client != consoleplayer && client != excludeClient)
+			I_SendSetupPacket(client, buf, size);
+	}
+}
+
+static void SendDisconnectRequest()
+{
+	uint8_t extra[1] = { static_cast<uint8_t>(consoleplayer) };
+	SendSetupPacketToClient(Net_Arbitrator, PRE_DISCONNECT_REQUEST, extra, 1);
+}
+
+// ---------------------------------------------------------------------------
+// Phase 1: Disconnect handshake handlers
+// ---------------------------------------------------------------------------
+
+// Host receives: a client wants to disconnect.
+void HandleDisconnectRequest()
+{
+	if (consoleplayer != Net_Arbitrator)
+		return;
+
+	const int clientNum = RemoteClient;
+	if (!NetworkClients.InGame(clientNum))
+		return;
+
+	DPrintf(DMSG_NOTIFY, "Received disconnect request from client %d\n", clientNum);
+
+	// Mark client for disconnect (same as existing CF_QUIT behavior).
+	ClientStates[clientNum].Flags |= CF_QUIT;
+
+	// Send acknowledgment back to the departing client.
+	SendSetupPacketToClient(clientNum, PRE_DISCONNECT_ACK);
+}
+
+// Client receives: host acknowledged our disconnect request.
+void HandleDisconnectAck()
+{
+	if (RemoteClient != Net_Arbitrator)
+		return;
+
+	DPrintf(DMSG_NOTIFY, "Received disconnect ACK from host\n");
+	bDisconnecting = false;
+}
+
+// Client receives: the host is leaving, a new host is designated.
+void HandleDisconnectNotify()
+{
+	if (RemoteClient != Net_Arbitrator)
+		return;
+
+	const int nextHost = NetBuffer[2];
+	DPrintf(DMSG_NOTIFY, "Host is leaving, new host is client %d\n", nextHost);
+
+	DisconnectClient(RemoteClient);
+	SetArbitrator(nextHost >= 0 ? nextHost : NetworkClients[0]);
+
+	if (demorecording)
+		G_CheckDemoStatus();
+
+	// Send confirmation back to the departing host.
+	// Note: we send to the OLD host address. Since they're still listening
+	// for confirms, they can receive this even though Net_Arbitrator changed.
+	SendSetupPacketToClient(RemoteClient, PRE_DISCONNECT_CONFIRM);
+}
+
+// Departing host receives: a client confirmed our disconnect notification.
+void HandleDisconnectConfirm()
+{
+	if (!bDisconnecting)
+		return;
+
+	const int clientNum = RemoteClient;
+	if (clientNum >= 0 && clientNum < (int)MAXPLAYERS)
+	{
+		DisconnectConfirmMask |= ((uint64_t)1u << clientNum);
+		DPrintf(DMSG_NOTIFY, "Client %d confirmed disconnect notification\n", clientNum);
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2: Host migration handlers
+// ---------------------------------------------------------------------------
+
+static void SerializeMigrationState(FMigrationState& state)
+{
+	state.currentConsistency = CurrentConsistency;
+	state.lastSentConsistency = LastSentConsistency;
+	state.currentLobbyID = CurrentLobbyID;
+	state.mutedClients = MutedClients;
+	state.cutsceneReady = CutsceneReady;
+	state.clientCount = 0;
+
+	for (auto client : NetworkClients)
+	{
+		if (client == consoleplayer)
+			continue;
+
+		auto& src = ClientStates[client];
+		auto& dst = state.clients[state.clientCount];
+		dst.clientNum = client;
+		dst.currentSequence = src.CurrentSequence;
+		dst.sequenceAck = src.SequenceAck;
+		dst.currentNetConsistency = src.CurrentNetConsistency;
+		dst.consistencyAck = src.ConsistencyAck;
+		dst.lastVerifiedConsistency = src.LastVerifiedConsistency;
+		dst.flags = src.Flags;
+		dst.averageLatency = src.AverageLatency;
+		state.clientCount++;
+	}
+}
+
+static void ApplyMigrationState(const FMigrationState& state)
+{
+	CurrentConsistency = state.currentConsistency;
+	LastSentConsistency = state.lastSentConsistency;
+	CurrentLobbyID = state.currentLobbyID;
+	MutedClients = state.mutedClients;
+	CutsceneReady = state.cutsceneReady;
+
+	for (int i = 0; i < state.clientCount; ++i)
+	{
+		const auto& src = state.clients[i];
+		if (src.clientNum < 0 || src.clientNum >= (int)MAXPLAYERS)
+			continue;
+
+		auto& dst = ClientStates[src.clientNum];
+		dst.CurrentSequence = src.currentSequence;
+		dst.SequenceAck = src.sequenceAck;
+		dst.CurrentNetConsistency = src.currentNetConsistency;
+		dst.ConsistencyAck = src.consistencyAck;
+		dst.LastVerifiedConsistency = src.lastVerifiedConsistency;
+		dst.Flags = src.flags;
+		dst.AverageLatency = src.averageLatency;
+	}
+}
+
+// New host receives: old host is beginning migration.
+void HandleMigrationBegin()
+{
+	if (RemoteClient != Net_Arbitrator)
+		return;
+
+	DPrintf(DMSG_NOTIFY, "Received migration begin from host\n");
+	bMigrating = true;
+}
+
+// New host receives: serialized host state data.
+void HandleMigrationState()
+{
+	if (RemoteClient != Net_Arbitrator || !bMigrating)
+		return;
+
+	DPrintf(DMSG_NOTIFY, "Received migration state from host (%zu bytes)\n", NetBufferLength);
+
+	// Deserialize the migration state from NetBuffer[2..].
+	if (NetBufferLength >= 2 + sizeof(FMigrationState))
+	{
+		memcpy(&PendingMigrationState, &NetBuffer[2], sizeof(FMigrationState));
+		bHasPendingMigration = true;
+	}
+
+	// ACK back to old host.
+	SendSetupPacketToClient(RemoteClient, PRE_MIGRATION_STATE_ACK);
+}
+
+// Old host receives: new host got the state.
+void HandleMigrationStateAck()
+{
+	if (!bDisconnecting)
+		return;
+
+	DPrintf(DMSG_NOTIFY, "New host acknowledged migration state\n");
+	// The departing host can now mark migration as complete.
+	// The actual disconnect continues in the D_QuitNetGame loop.
+	bMigrating = false;
+}
+
+// Non-host client receives: a new host has taken over.
+void HandleMigrationComplete()
+{
+	const int newHost = NetBuffer[2];
+	DPrintf(DMSG_NOTIFY, "Migration complete, new host is client %d\n", newHost);
+
+	bMigrating = false;
+
+	if (newHost != Net_Arbitrator)
+		SetArbitrator(newHost);
+
+	// Send ready to the new host.
+	SendSetupPacketToClient(newHost, PRE_MIGRATION_READY);
+}
+
+// New host receives: a client is ready after migration.
+void HandleMigrationReady()
+{
+	if (consoleplayer != Net_Arbitrator)
+		return;
+
+	DPrintf(DMSG_NOTIFY, "Client %d is ready after migration\n", RemoteClient);
+	// All clients will naturally resync via Net_ResetCommands + Net_SetWaiting
+	// which was called in SetArbitrator().
+}
+
+// ---------------------------------------------------------------------------
+// Phase 3: Mid-game join handlers (infrastructure only, actual state
+// transfer deferred to issue #22)
+// ---------------------------------------------------------------------------
+
+CUSTOM_CVAR(Bool, net_allowjoin, false, CVAR_SERVERINFO | CVAR_NOSAVE)
+{
+	// No special handling needed.
+}
+
+// Host receives: an unknown client wants to join mid-game.
+void HandleMidgameConnect()
+{
+	if (consoleplayer != Net_Arbitrator)
+		return;
+
+	if (!net_allowjoin)
+	{
+		uint8_t buf[3] = { NCMD_SETUP, PRE_MIDGAME_REJECT, REJECT_DISABLED };
+		I_SendSetupPacketToAddress(buf, 3);
+		return;
+	}
+
+	if (bMigrating)
+	{
+		uint8_t buf[3] = { NCMD_SETUP, PRE_MIDGAME_REJECT, REJECT_IN_TRANSITION };
+		I_SendSetupPacketToAddress(buf, 3);
+		return;
+	}
+
+	// Find a free player slot.
+	int freeSlot = -1;
+	for (int i = 0; i < MaxClients; ++i)
+	{
+		if (!NetworkClients.InGame(i))
+		{
+			freeSlot = i;
+			break;
+		}
+	}
+
+	if (freeSlot < 0)
+	{
+		uint8_t buf[3] = { NCMD_SETUP, PRE_MIDGAME_REJECT, REJECT_FULL };
+		I_SendSetupPacketToAddress(buf, 3);
+		return;
+	}
+
+	// TODO: Validate engine version and password from NetBuffer[2..] here.
+	// For now, accept the connection.
+
+	// Send acceptance with slot number.
+	uint8_t buf[4] = { NCMD_SETUP, PRE_MIDGAME_ACCEPT, static_cast<uint8_t>(freeSlot), TicDup };
+	I_SendSetupPacketToAddress(buf, 4);
+
+	// Register the slot and initialize.
+	NetworkClients += freeSlot;
+	I_SetClientAddress(freeSlot);
+	ClientConnecting(freeSlot);
+}
+
+// Joining client receives: host accepted our mid-game join.
+void HandleMidgameAccept()
+{
+	if (consoleplayer != -1)
+		return; // Already have a slot.
+
+	const int slot = NetBuffer[2];
+	const uint8_t ticDup = NetBuffer[3];
+
+	consoleplayer = slot;
+	TicDup = ticDup;
+	NetworkClients += slot;
+
+	DPrintf(DMSG_NOTIFY, "Mid-game join accepted, assigned slot %d\n", slot);
+	// Issue #22 will handle receiving and applying game state from here.
+}
+
+// Joining client receives: host rejected our mid-game join.
+void HandleMidgameReject()
+{
+	const uint8_t reason = NetBuffer[2];
+	const char* reasonStr = "unknown";
+	switch (reason)
+	{
+	case REJECT_FULL:			reasonStr = "game is full"; break;
+	case REJECT_IN_TRANSITION:	reasonStr = "host migration in progress"; break;
+	case REJECT_BANNED:			reasonStr = "banned"; break;
+	case REJECT_PASSWORD:		reasonStr = "wrong password"; break;
+	case REJECT_VERIFICATION:	reasonStr = "verification failed"; break;
+	case REJECT_DISABLED:		reasonStr = "mid-game joining is disabled"; break;
+	}
+	Printf("Cannot join: %s\n", reasonStr);
+}
+
+// Non-host client receives: a new player is joining.
+void HandleMidgamePlayerJoin()
+{
+	if (RemoteClient != Net_Arbitrator)
+		return;
+
+	const int newPlayer = NetBuffer[2];
+	DPrintf(DMSG_NOTIFY, "Player %d is joining mid-game\n", newPlayer);
+	NetworkClients += newPlayer;
+
+	// ACK back to host.
+	SendSetupPacketToClient(Net_Arbitrator, PRE_MIDGAME_PLAYER_ACK);
+}
+
+// Host receives: a client acknowledged the new player.
+void HandleMidgamePlayerAck()
+{
+	if (consoleplayer != Net_Arbitrator)
+		return;
+
+	DPrintf(DMSG_NOTIFY, "Client %d acknowledged new player\n", RemoteClient);
+}
+
+// ---------------------------------------------------------------------------
 
 static bool IsMapLoaded()
 {
@@ -855,6 +1244,9 @@ static void GetPackets()
 	{
 		const int clientNum =  RemoteClient;
 		auto& clientState = ClientStates[clientNum];
+
+		// Track last valid packet time for heartbeat timeout detection.
+		clientState.LastPacketReceivedTime = I_msTime();
 
 		if (NetBuffer[0] & NCMD_EXIT)
 		{
@@ -1329,6 +1721,26 @@ void NetUpdate(int tics)
 		}
 
 		CheckConsistencies();
+
+		// Heartbeat timeout: if the host hasn't heard from a client in CLIENT_TIMEOUT_MS,
+		// treat them as disconnected (crashed or lost connection).
+		if (consoleplayer == Net_Arbitrator)
+		{
+			const uint64_t now = I_msTime();
+			for (auto client : NetworkClients)
+			{
+				if (client == consoleplayer)
+					continue;
+
+				auto& state = ClientStates[client];
+				if (state.LastPacketReceivedTime > 0 && (now - state.LastPacketReceivedTime) >= CLIENT_TIMEOUT_MS)
+				{
+					Printf("Client %d timed out (no packets for %llums)\n", client, (unsigned long long)(now - state.LastPacketReceivedTime));
+					state.Flags |= CF_QUIT;
+					state.LastPacketReceivedTime = 0; // Prevent repeated timeout messages.
+				}
+			}
+		}
 	}
 
 	// Sit idle after the level has loaded until everyone is ready to go. This keeps players better
@@ -1950,14 +2362,18 @@ bool D_CheckNetGame()
 		net_extratic = true;
 
 	players[Net_Arbitrator].settings_controller = true;
+	const uint64_t startTime = I_msTime();
 	for (auto client : NetworkClients)
+	{
 		playeringame[client] = true;
+		ClientStates[client].LastPacketReceivedTime = startTime;
+	}
 
 	if (MaxClients > 1u)
 	{
 		Printf("Player %d of %d\n", consoleplayer + 1, MaxClients);
 	}
-	
+
 	return true;
 }
 
@@ -1971,14 +2387,14 @@ void D_QuitNetGame()
 	if (!netgame || !usergame || consoleplayer == -1 || demoplayback || NetworkClients.Size() == 1)
 		return;
 
-	// Send a bunch of packets for stability.
-	NetBuffer[0] = NCMD_EXIT;
+	bDisconnecting = true;
+	DisconnectTimestamp = I_msTime();
+	DisconnectRetries = 0;
+
 	if (consoleplayer == Net_Arbitrator)
 	{
-		// This currently doesn't really do anything, but it's being split off into its
-		// own branch should proper host migration be added in the future (i.e. sending over stored event
-		// data rather than just dropping it entirely).
-		int nextHost = 0;
+		// Host path: transfer state to the next host, then notify everyone.
+		int nextHost = -1;
 		for (auto client : NetworkClients)
 		{
 			if (client != Net_Arbitrator)
@@ -1988,13 +2404,81 @@ void D_QuitNetGame()
 			}
 		}
 
-		NetBuffer[1] = nextHost;
-		for (int i = 0; i < 4; ++i)
+		if (nextHost < 0)
 		{
-			for (auto client : NetworkClients)
+			bDisconnecting = false;
+			return;
+		}
+
+		// Phase 2: Serialize migration state and send to new host.
+		SendSetupPacketToClient(nextHost, PRE_MIGRATION_BEGIN);
+
+		FMigrationState migState = {};
+		SerializeMigrationState(migState);
+		uint8_t migBuf[2 + sizeof(FMigrationState)];
+		migBuf[0] = NCMD_SETUP;
+		migBuf[1] = PRE_MIGRATION_STATE;
+		memcpy(&migBuf[2], &migState, sizeof(FMigrationState));
+		I_SendSetupPacket(nextHost, migBuf, sizeof(migBuf));
+
+		// Wait for the new host to acknowledge the migration state.
+		bMigrating = true;
+		DisconnectTimestamp = I_msTime();
+		DisconnectRetries = 0;
+		while (bMigrating && DisconnectRetries < DISCONNECT_MAX_RETRIES)
+		{
+			while (HGetPacket())
 			{
-				if (client != Net_Arbitrator)
-					HSendPacket(client, 2);
+				if (NetBuffer[0] & NCMD_SETUP)
+					HandleIncomingConnection();
+			}
+
+			const uint64_t now = I_msTime();
+			if (now - DisconnectTimestamp >= (uint64_t)DISCONNECT_TIMEOUT_MS)
+			{
+				I_SendSetupPacket(nextHost, migBuf, sizeof(migBuf));
+				DisconnectTimestamp = now;
+				DisconnectRetries++;
+			}
+
+			I_WaitVBL(1);
+		}
+
+		// Phase 1: Notify all clients that the host is leaving.
+		uint8_t nextHostByte = static_cast<uint8_t>(nextHost);
+		SendSetupPacketToAll(PRE_DISCONNECT_NOTIFY, &nextHostByte, 1);
+
+		// Build expected confirmation mask from all remaining clients.
+		uint64_t expectedMask = 0;
+		for (auto client : NetworkClients)
+		{
+			if (client != consoleplayer)
+				expectedMask |= ((uint64_t)1u << client);
+		}
+
+		DisconnectConfirmMask = 0;
+		DisconnectTimestamp = I_msTime();
+		DisconnectRetries = 0;
+		while ((DisconnectConfirmMask & expectedMask) != expectedMask && DisconnectRetries < DISCONNECT_MAX_RETRIES)
+		{
+			while (HGetPacket())
+			{
+				if (NetBuffer[0] & NCMD_SETUP)
+					HandleIncomingConnection();
+			}
+
+			const uint64_t now = I_msTime();
+			if (now - DisconnectTimestamp >= (uint64_t)DISCONNECT_TIMEOUT_MS)
+			{
+				// Resend to clients that haven't confirmed yet.
+				for (auto client : NetworkClients)
+				{
+					if (client != consoleplayer && !(DisconnectConfirmMask & ((uint64_t)1u << client)))
+						SendSetupPacketToClient(client, PRE_DISCONNECT_NOTIFY, &nextHostByte, 1);
+				}
+
+				DisconnectTimestamp = now;
+				DisconnectRetries++;
 			}
 
 			I_WaitVBL(1);
@@ -2002,13 +2486,44 @@ void D_QuitNetGame()
 	}
 	else
 	{
-		for (int i = 0; i < 4; ++i)
+		// Client path: send disconnect request, wait for ACK from host.
+		SendDisconnectRequest();
+		DisconnectTimestamp = I_msTime();
+		DisconnectRetries = 0;
+
+		while (bDisconnecting && DisconnectRetries < DISCONNECT_MAX_RETRIES)
 		{
-			// Only the host should know about this information.
-			HSendPacket(Net_Arbitrator, 1);
+			while (HGetPacket())
+			{
+				if (NetBuffer[0] & NCMD_SETUP)
+					HandleIncomingConnection();
+			}
+
+			const uint64_t now = I_msTime();
+			if (now - DisconnectTimestamp >= (uint64_t)DISCONNECT_TIMEOUT_MS)
+			{
+				SendDisconnectRequest();
+				DisconnectTimestamp = now;
+				DisconnectRetries++;
+			}
+
 			I_WaitVBL(1);
 		}
+
+		// If the handshake timed out, fall back to the legacy fire-and-forget method.
+		if (bDisconnecting)
+		{
+			DPrintf(DMSG_WARNING, "Disconnect handshake timed out, falling back to legacy\n");
+			NetBuffer[0] = NCMD_EXIT;
+			for (int i = 0; i < 4; ++i)
+			{
+				HSendPacket(Net_Arbitrator, 1);
+				I_WaitVBL(1);
+			}
+		}
 	}
+
+	bDisconnecting = false;
 }
 
 ADD_STAT(network)

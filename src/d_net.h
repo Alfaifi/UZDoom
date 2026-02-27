@@ -45,6 +45,10 @@ enum EClientFlags
 	CF_MISSING_CON = 1 << 3,	// If a consistency was missed/out of order, ask this client to send back over their info.
 	CF_RETRANSMIT_CON = 1 << 4,	// If set, this client needs consistency data resent to them.
 	CF_UPDATED = 1 << 5,	// Got an updated packet from this client.
+	CF_DISCONNECT_PENDING = 1 << 6,		// Client has requested disconnect, waiting for ACK propagation.
+	CF_DISCONNECT_NOTIFIED = 1 << 7,	// Host has notified others about this client's departure.
+	CF_JOINING = 1 << 8,				// Client is in the process of joining mid-game.
+	CF_AWAITING_STATE = 1 << 9,			// Client is waiting for game state transfer.
 
 	CF_RETRANSMIT = CF_RETRANSMIT_CON | CF_RETRANSMIT_SEQ,
 	CF_MISSING = CF_MISSING_CON | CF_MISSING_SEQ,
@@ -102,6 +106,7 @@ struct FClientNetState
 	uint64_t	RecvTime[MAXSENDTICS] = {};	// Timestamp for when the client acknowledged our last packet.
 
 	int				Flags = 0;				// State of this client.
+	uint64_t		LastPacketReceivedTime = 0;	// Timestamp of last valid packet from this client, for timeout detection.
 
 	uint8_t			StabilityBuffer = 0u;	// Account for if the client is trying to stabilize when measuring their performance.
 	uint8_t			ResendID = 0u;			// Make sure that if the retransmit happened on a wait barrier, it can be properly resent back over.
@@ -164,5 +169,49 @@ extern FClientNetState		ClientStates[MAXPLAYERS];
 
 class player_t;
 class DObject;
+
+// Host migration state transferred from departing host to new host.
+struct FMigrationClientData
+{
+	int		clientNum;
+	int		currentSequence;
+	int		sequenceAck;
+	int		currentNetConsistency;
+	int		consistencyAck;
+	int		lastVerifiedConsistency;
+	int		flags;
+	uint16_t averageLatency;
+};
+
+struct FMigrationState
+{
+	int			currentConsistency;
+	int			lastSentConsistency;
+	uint8_t		currentLobbyID;
+	uint64_t	mutedClients;
+	uint64_t	cutsceneReady;
+	int			clientCount;
+	FMigrationClientData clients[MAXPLAYERS];
+};
+
+// Disconnect handshake handlers (called from HandleIncomingConnection in i_net.cpp)
+void HandleDisconnectRequest();
+void HandleDisconnectAck();
+void HandleDisconnectNotify();
+void HandleDisconnectConfirm();
+
+// Host migration handlers
+void HandleMigrationBegin();
+void HandleMigrationState();
+void HandleMigrationStateAck();
+void HandleMigrationComplete();
+void HandleMigrationReady();
+
+// Mid-game join handlers
+void HandleMidgameConnect();
+void HandleMidgameAccept();
+void HandleMidgameReject();
+void HandleMidgamePlayerJoin();
+void HandleMidgamePlayerAck();
 
 #endif

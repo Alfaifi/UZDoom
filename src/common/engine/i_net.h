@@ -113,7 +113,60 @@ bool I_InitNetwork();
 void I_ClearClient(size_t client);
 void I_NetCmd(ENetCommand cmd);
 void I_NetDone();
+enum ENetConnectType : uint8_t
+{
+	PRE_HEARTBEAT,			// Clients are keeping each other's connections alive
+	PRE_CONNECT,			// Sent from guest to host for initial connection
+	PRE_CONNECT_ACK,		// Sent from host to guest to confirm they've been connected
+	PRE_DISCONNECT,			// Sent from host to guest when another guest leaves
+	PRE_USER_INFO,			// Clients are sending each other user infos
+	PRE_USER_INFO_ACK,		// Clients are confirming sent user infos
+	PRE_GAME_INFO,			// Sent from host to guest containing general game info
+	PRE_GAME_INFO_ACK,		// Sent from guest to host confirming game info was gotten
+	PRE_GO,					// Sent from host to guest telling them to start the game
+
+	PRE_FULL,				// Sent from host to guest if the lobby is full
+	PRE_IN_PROGRESS,		// Sent from host to guest if the game has already started
+	PRE_WRONG_PASSWORD,		// Sent from host to guest if their provided password was wrong
+	PRE_VERIFICATION_ERROR,	// Sent from host to guest if something failed during the verification step.
+	PRE_KICKED,				// Sent from host to guest if the host kicked them from the game
+	PRE_BANNED,				// Sent from host to guest if the host banned them from the game
+
+	// In-game disconnect handshake
+	PRE_DISCONNECT_REQUEST,	// Client -> Host: "I want to leave"
+	PRE_DISCONNECT_ACK,		// Host -> Client: "Acknowledged, you may leave"
+	PRE_DISCONNECT_NOTIFY,	// Host -> All: "Client N has left" (also used for host leaving with nextHost)
+	PRE_DISCONNECT_CONFIRM,	// All -> Host: "Got the disconnect notification"
+
+	// Host migration
+	PRE_MIGRATION_BEGIN,	// Old host -> New host: "You are the new host"
+	PRE_MIGRATION_STATE,	// Old host -> New host: serialized host state
+	PRE_MIGRATION_STATE_ACK,// New host -> Old host: "Got the state"
+	PRE_MIGRATION_COMPLETE,	// New host -> All: "I am the new host, resume"
+	PRE_MIGRATION_READY,	// All -> New host: "Acknowledged new host"
+
+	// Mid-game join infrastructure
+	PRE_MIDGAME_CONNECT,	// New client -> Host: "I want to join mid-game"
+	PRE_MIDGAME_ACCEPT,		// Host -> New client: "Slot assigned, wait for state"
+	PRE_MIDGAME_REJECT,		// Host -> New client: "Cannot join" + reason
+	PRE_MIDGAME_PLAYER_JOIN,// Host -> All existing: "Player N is joining"
+	PRE_MIDGAME_PLAYER_ACK,	// All -> Host: "Acknowledged new player"
+};
+
+enum EMidgameRejectReason : uint8_t
+{
+	REJECT_FULL,
+	REJECT_IN_TRANSITION,
+	REJECT_BANNED,
+	REJECT_PASSWORD,
+	REJECT_VERIFICATION,
+	REJECT_DISABLED,
+};
+
 void HandleIncomingConnection();
 void CloseNetwork();
+void I_SetClientAddress(int client);
+void I_SendSetupPacket(int client, const uint8_t* data, size_t size);
+void I_SendSetupPacketToAddress(const uint8_t* data, size_t size);
 
 #endif
