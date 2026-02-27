@@ -105,25 +105,7 @@ constexpr size_t MaxTransmitSize = 8000u;
 constexpr size_t MinCompressionSize = 10u;
 constexpr size_t MaxPasswordSize = 256u;
 
-enum ENetConnectType : uint8_t
-{
-	PRE_HEARTBEAT,			// Clients are keeping each other's connections alive
-	PRE_CONNECT,			// Sent from guest to host for initial connection
-	PRE_CONNECT_ACK,		// Sent from host to guest to confirm they've been connected
-	PRE_DISCONNECT,			// Sent from host to guest when another guest leaves
-	PRE_USER_INFO,			// Clients are sending each other user infos
-	PRE_USER_INFO_ACK,		// Clients are confirming sent user infos
-	PRE_GAME_INFO,			// Sent from host to guest containing general game info
-	PRE_GAME_INFO_ACK,		// Sent from guest to host confirming game info was gotten
-	PRE_GO,					// Sent from host to guest telling them to start the game
-
-	PRE_FULL,				// Sent from host to guest if the lobby is full
-	PRE_IN_PROGRESS,		// Sent from host to guest if the game has already started
-	PRE_WRONG_PASSWORD,		// Sent from host to guest if their provided password was wrong
-	PRE_VERIFICATION_ERROR,	// Sent from host to guest if something failed during the verification step.
-	PRE_KICKED,				// Sent from host to guest if the host kicked them from the game
-	PRE_BANNED,				// Sent from host to guest if the host banned them from the game
-};
+// ENetConnectType enum is now in i_net.h
 
 enum EConnectionStatus
 {
@@ -178,6 +160,24 @@ static FConnection	Connected[MAXPLAYERS] = {};
 static uint8_t		TransmitBuffer[MaxTransmitSize] = {};
 static TArray<sockaddr_in> BannedConnections = {};
 static bool bGameStarted = false;
+static sockaddr_in LastUnknownAddress = {};	// Address of last unknown client (for mid-game join replies).
+
+// Forward declarations for disconnect/migration/join handlers defined in d_net.cpp.
+// These are called from HandleIncomingConnection() below.
+extern void HandleDisconnectRequest();
+extern void HandleDisconnectAck();
+extern void HandleDisconnectNotify();
+extern void HandleDisconnectConfirm();
+extern void HandleMigrationBegin();
+extern void HandleMigrationState();
+extern void HandleMigrationStateAck();
+extern void HandleMigrationComplete();
+extern void HandleMigrationReady();
+extern void HandleMidgameConnect();
+extern void HandleMidgameAccept();
+extern void HandleMidgameReject();
+extern void HandleMidgamePlayerJoin();
+extern void HandleMidgamePlayerAck();
 
 CUSTOM_CVAR(String, net_password, "", CVAR_IGNORE)
 {
@@ -530,11 +530,10 @@ static void GetPacket(sockaddr_in* const from = nullptr)
 		}
 		else if (client == -1 && bGameStarted)
 		{
-			NetBuffer[0] = NCMD_SETUP;
-			NetBuffer[1] = PRE_IN_PROGRESS;
-			NetBufferLength = 2u;
-			SendPacket(fromAddress);
-			msgSize = 0;
+			// Allow NCMD_SETUP packets from unknown clients during gameplay
+			// so mid-game join requests can reach HandleIncomingConnection().
+			// Store the address for reply since we don't have a Connected[] slot yet.
+			LastUnknownAddress = fromAddress;
 		}
 		else
 		{
@@ -709,17 +708,116 @@ static void RemoveClientConnection(int client)
 	}
 }
 
-void HandleIncomingConnection()
+void I_SetClientAddress(int client)
 {
-	if (consoleplayer != Net_Arbitrator || RemoteClient == -1)
+	if (client >= 0 && client < (int)MAXPLAYERS)
+	{
+		Connected[client].Address = LastUnknownAddress;
+		Connected[client].Status = CSTAT_READY;
+	}
+}
+
+void I_SendSetupPacket(int client, const uint8_t* data, size_t size)
+{
+	if (client < 0 || client >= (int)MAXPLAYERS || Connected[client].Status == CSTAT_NONE)
 		return;
 
-	if (Connected[RemoteClient].Status == CSTAT_READY)
+	memcpy(NetBuffer, data, size);
+	NetBufferLength = size;
+	SendPacket(Connected[client].Address);
+}
+
+void I_SendSetupPacketToAddress(const uint8_t* data, size_t size)
+{
+	// Send a setup packet to the last received unknown address.
+	// Used for replying to mid-game join requests from unknown clients.
+	memcpy(NetBuffer, data, size);
+	NetBufferLength = size;
+	SendPacket(LastUnknownAddress);
+}
+
+void HandleIncomingConnection()
+{
+	const uint8_t subtype = NetBuffer[1];
+
+	// During gameplay, dispatch disconnect/migration/join messages.
+	// These can come from known clients (RemoteClient >= 0) or unknown clients (mid-game join).
+	switch (subtype)
 	{
-		NetBuffer[0] = NCMD_SETUP;
-		NetBuffer[1] = PRE_GO;
-		NetBufferLength = 2u;
-		SendPacket(Connected[RemoteClient].Address);
+	// Phase 1: Disconnect handshake
+	case PRE_DISCONNECT_REQUEST:
+		if (RemoteClient >= 0)
+			HandleDisconnectRequest();
+		return;
+	case PRE_DISCONNECT_ACK:
+		if (RemoteClient >= 0)
+			HandleDisconnectAck();
+		return;
+	case PRE_DISCONNECT_NOTIFY:
+		if (RemoteClient >= 0)
+			HandleDisconnectNotify();
+		return;
+	case PRE_DISCONNECT_CONFIRM:
+		if (RemoteClient >= 0)
+			HandleDisconnectConfirm();
+		return;
+
+	// Phase 2: Host migration
+	case PRE_MIGRATION_BEGIN:
+		if (RemoteClient >= 0)
+			HandleMigrationBegin();
+		return;
+	case PRE_MIGRATION_STATE:
+		if (RemoteClient >= 0)
+			HandleMigrationState();
+		return;
+	case PRE_MIGRATION_STATE_ACK:
+		if (RemoteClient >= 0)
+			HandleMigrationStateAck();
+		return;
+	case PRE_MIGRATION_COMPLETE:
+		if (RemoteClient >= 0)
+			HandleMigrationComplete();
+		return;
+	case PRE_MIGRATION_READY:
+		if (RemoteClient >= 0)
+			HandleMigrationReady();
+		return;
+
+	// Phase 3: Mid-game join
+	case PRE_MIDGAME_CONNECT:
+		HandleMidgameConnect();
+		return;
+	case PRE_MIDGAME_ACCEPT:
+		if (RemoteClient >= 0)
+			HandleMidgameAccept();
+		return;
+	case PRE_MIDGAME_REJECT:
+		if (RemoteClient >= 0)
+			HandleMidgameReject();
+		return;
+	case PRE_MIDGAME_PLAYER_JOIN:
+		if (RemoteClient >= 0)
+			HandleMidgamePlayerJoin();
+		return;
+	case PRE_MIDGAME_PLAYER_ACK:
+		if (RemoteClient >= 0)
+			HandleMidgamePlayerAck();
+		return;
+
+	// Existing lobby behavior: resend PRE_GO to ready clients
+	default:
+		if (consoleplayer != Net_Arbitrator || RemoteClient == -1)
+			return;
+
+		if (Connected[RemoteClient].Status == CSTAT_READY)
+		{
+			NetBuffer[0] = NCMD_SETUP;
+			NetBuffer[1] = PRE_GO;
+			NetBufferLength = 2u;
+			SendPacket(Connected[RemoteClient].Address);
+		}
+		return;
 	}
 }
 
