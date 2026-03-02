@@ -839,6 +839,8 @@ void G_BuildTiccmd (usercmd_t *cmd)
 static int LookAdjust(int look)
 {
 	look <<= 16;
+	if (consoleplayer < 0 || !playeringame[consoleplayer])
+		return look;
 	if (players[consoleplayer].playerstate != PST_DEAD &&		// No adjustment while dead.
 		players[consoleplayer].ReadyWeapon != NULL)			// No adjustment if no weapon.
 	{

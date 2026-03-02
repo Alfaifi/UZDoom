@@ -2993,7 +2993,7 @@ static bool System_DispatchEvent(event_t* ev)
 {
 	shiftState.AddEvent(ev);
 
-	if (ev->type == EV_Mouse && menuactive == MENU_Off && ConsoleState != c_down && ConsoleState != c_falling && !primaryLevel->localEventManager->Responder(ev) && !paused)
+	if (ev->type == EV_Mouse && gamestate == GS_LEVEL && menuactive == MENU_Off && ConsoleState != c_down && ConsoleState != c_falling && !primaryLevel->localEventManager->Responder(ev) && !paused)
 	{
 		if (buttonMap.ButtonDown(Button_Mlook) || freelook)
 		{
