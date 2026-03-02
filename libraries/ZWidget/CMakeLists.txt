@@ -58,6 +58,8 @@ set(ZWIDGET_SOURCES
 	src/widgets/listview/listview.cpp
 	src/widgets/tabwidget/tabwidget.cpp
 	src/window/window.cpp
+	src/window/null/null_display_backend.cpp
+	src/window/null/null_display_backend.h
 	src/window/stub/stub_open_folder_dialog.cpp
 	src/window/stub/stub_open_folder_dialog.h
 	src/window/stub/stub_open_file_dialog.cpp
@@ -188,6 +190,7 @@ source_group("src\\window\\win32" REGULAR_EXPRESSION "${CMAKE_CURRENT_SOURCE_DIR
 source_group("src\\window\\sdl2" REGULAR_EXPRESSION "${CMAKE_CURRENT_SOURCE_DIR}/src/window/sdl2/.+")
 source_group("src\\window\\x11" REGULAR_EXPRESSION "${CMAKE_CURRENT_SOURCE_DIR}/src/window/x11/.+")
 source_group("src\\window\\wayland" REGULAR_EXPRESSION "${CMAKE_CURRENT_SOURCE_DIR}/src/window/wayland/.+")
+source_group("src\\window\\null" REGULAR_EXPRESSION "${CMAKE_CURRENT_SOURCE_DIR}/src/window/null/.+")
 source_group("src\\window\\dbus" REGULAR_EXPRESSION "${CMAKE_CURRENT_SOURCE_DIR}/src/window/dbus/.+")
 source_group("src\\systemdialogs" REGULAR_EXPRESSION "${CMAKE_CURRENT_SOURCE_DIR}/src/systemdialogs/.+")
 source_group("include" REGULAR_EXPRESSION "${CMAKE_CURRENT_SOURCE_DIR}/include/zwidget/.+")

@@ -53,6 +53,7 @@
 #include "s_soundinternal.h"
 #include "hardware.h"
 #include "d_eventbase.h"
+#include "doomstat.h"
 #include "v_text.h"
 #include "version.h"
 #include "engineerrors.h"
@@ -597,6 +598,7 @@ void I_GetEvent ()
 //
 void I_StartTic ()
 {
+	if (dedicatedServer) return;
 	BlockMouseMove--;
 	buttonMap.ResetButtonTriggers ();
 	I_CheckGUICapture ();
@@ -611,6 +613,7 @@ void I_StartTic ()
 //
 void I_StartFrame ()
 {
+	if (dedicatedServer) return;
 	if (use_joystick)
 	{
 		for (int i = 0; i < NUM_JOYDEVICES; ++i)

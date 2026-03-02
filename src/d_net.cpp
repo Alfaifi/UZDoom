@@ -30,6 +30,7 @@
 #include "d_eventbase.h"
 #include "d_main.h"
 #include "d_net.h"
+#include "doomstat.h"
 #include "d_netinf.h"
 #include "events.h"
 #include "g_game.h"
@@ -165,6 +166,9 @@ static bool		bHasPendingMigration = false;	// True if we received migration stat
 constexpr int		DISCONNECT_TIMEOUT_MS = 500;	// Retry disconnect request/notify after this many ms.
 constexpr int		DISCONNECT_MAX_RETRIES = 8;		// Give up after this many retries (4 seconds total).
 constexpr uint64_t	CLIENT_TIMEOUT_MS = 10000;		// Treat client as disconnected after 10 seconds of silence.
+
+// Client-side: set when the host is a dedicated server (slot 0 is ghost).
+static bool			hostIsDedicated = false;
 
 void D_ProcessEvents(void); 
 void G_BuildTiccmd(usercmd_t *cmd);
@@ -1494,6 +1498,9 @@ static void CheckConsistencies()
 	// if the client's current position doesn't agree with the host.
 	for (auto client : NetworkClients)
 	{
+		if (!playeringame[client])
+			continue;
+
 		auto& clientState = ClientStates[client];
 		// If previously inconsistent, always mark it as such going forward. We don't want this to
 		// accidentally go away at some point since the game state is already completely broken.
@@ -1567,6 +1574,8 @@ static void MakeConsistencies()
 	const uint32_t rngSum = StaticSumSeeds();
 	for (auto client : NetworkClients)
 	{
+		if (!playeringame[client])
+			continue;
 		auto& clientState = ClientStates[client];
 		clientState.LocalConsistency[CurrentConsistency % BACKUPTICS] = CalculateConsistency(client, rngSum);
 	}
@@ -1804,8 +1813,11 @@ void NetUpdate(int tics)
 
 	for (int i = 0; i < tics; ++i)
 	{
-		I_StartTic();
-		D_ProcessEvents();
+		if (!dedicatedServer)
+		{
+			I_StartTic();
+			D_ProcessEvents();
+		}
 		if (pauseext || !netGood)
 			break;
 
@@ -1814,8 +1826,16 @@ void NetUpdate(int tics)
 			--SkipCommandAmount;
 			continue;
 		}
-		
-		G_BuildTiccmd(&LocalCmds[ClientTic++ % LOCALCMDTICS]);
+
+		if (dedicatedServer)
+		{
+			// Dedicated server generates empty commands — no input, no actor.
+			memset(&LocalCmds[ClientTic++ % LOCALCMDTICS], 0, sizeof(usercmd_t));
+		}
+		else
+		{
+			G_BuildTiccmd(&LocalCmds[ClientTic++ % LOCALCMDTICS]);
+		}
 		if (TicDup == 1)
 		{
 			Net_NewClientTic();
@@ -2327,6 +2347,9 @@ void Net_SetGameInfo(TArrayView<uint8_t>& stream)
 	{
 		WriteInt8(0, stream);
 	}
+
+	// Tell clients whether the host is a dedicated server (ghost player 0).
+	WriteInt8(dedicatedServer ? 1 : 0, stream);
 }
 
 
@@ -2348,6 +2371,10 @@ void Net_ReadGameInfo(TArrayView<uint8_t>& stream)
 		}
 	}
 
+	// Check if the host is a dedicated server — if so, slot 0 is not a real player.
+	if (ReadInt8(stream))
+		hostIsDedicated = true;
+
 	// Reset this immediately so any further RNG calls the engine has to make will be synced.
 	FRandom::StaticClearRandom();
 }
@@ -2365,13 +2392,22 @@ bool D_CheckNetGame()
 	const uint64_t startTime = I_msTime();
 	for (auto client : NetworkClients)
 	{
+		// Ghost player: skip slot 0 on both the dedicated server itself and on clients
+		// that know the host is dedicated.
+		if ((dedicatedServer && client == consoleplayer) ||
+			(hostIsDedicated && client == 0))
+			continue;
+
 		playeringame[client] = true;
 		ClientStates[client].LastPacketReceivedTime = startTime;
 	}
 
 	if (MaxClients > 1u)
 	{
-		Printf("Player %d of %d\n", consoleplayer + 1, MaxClients);
+		if (dedicatedServer)
+			Printf("Dedicated server hosting %d players\n", MaxClients);
+		else
+			Printf("Player %d of %d\n", consoleplayer + 1, MaxClients);
 	}
 
 	return true;
@@ -2390,6 +2426,53 @@ void D_QuitNetGame()
 	bDisconnecting = true;
 	DisconnectTimestamp = I_msTime();
 	DisconnectRetries = 0;
+
+	if (dedicatedServer)
+	{
+		// Dedicated server: no migration, just tell everyone the server is shutting down.
+		Printf("Dedicated server shutting down, disconnecting all clients\n");
+
+		// Send disconnect notification (no next host — 0xFF means server is gone).
+		uint8_t noNextHost = 0xFF;
+		SendSetupPacketToAll(PRE_DISCONNECT_NOTIFY, &noNextHost, 1);
+
+		// Wait briefly for confirmations.
+		uint64_t expectedMask = 0;
+		for (auto client : NetworkClients)
+		{
+			if (client != consoleplayer)
+				expectedMask |= ((uint64_t)1u << client);
+		}
+
+		DisconnectConfirmMask = 0;
+		DisconnectTimestamp = I_msTime();
+		DisconnectRetries = 0;
+		while ((DisconnectConfirmMask & expectedMask) != expectedMask && DisconnectRetries < DISCONNECT_MAX_RETRIES)
+		{
+			while (HGetPacket())
+			{
+				if (NetBuffer[0] & NCMD_SETUP)
+					HandleIncomingConnection();
+			}
+
+			const uint64_t now = I_msTime();
+			if (now - DisconnectTimestamp >= (uint64_t)DISCONNECT_TIMEOUT_MS)
+			{
+				for (auto client : NetworkClients)
+				{
+					if (client != consoleplayer && !(DisconnectConfirmMask & ((uint64_t)1u << client)))
+						SendSetupPacketToClient(client, PRE_DISCONNECT_NOTIFY, &noNextHost, 1);
+				}
+				DisconnectTimestamp = now;
+				DisconnectRetries++;
+			}
+
+			I_WaitVBL(1);
+		}
+
+		bDisconnecting = false;
+		return;
+	}
 
 	if (consoleplayer == Net_Arbitrator)
 	{
@@ -2797,7 +2880,7 @@ void TryRunTics()
 
 		// If we actually advanced a command, update the player's position (even if a
 		// tic passes this isn't guaranteed to happen since it's capped to 35 in advance).
-		if (ClientTic > startCommand)
+		if (ClientTic > startCommand && playeringame[consoleplayer])
 		{
 			LagState = LAG_PREDICTING;
 			P_PredictClient();
@@ -2805,12 +2888,16 @@ void TryRunTics()
 
 		// If we actually did have some tics available, make sure the UI
 		// still has a chance to run.
-		for (int i = 0; i < totalTics; ++i)
-			P_RunClientSideLogic();
+		if (!dedicatedServer)
+		{
+			for (int i = 0; i < totalTics; ++i)
+				P_RunClientSideLogic();
+		}
 
 		if (totalTics > 0)
 		{
-			S_UpdateSounds(players[consoleplayer].camera, primaryLevel->LocalWorldTimer - min<int>(primaryLevel->LocalWorldTimer, worldTimer));
+			if (playeringame[consoleplayer])
+				S_UpdateSounds(players[consoleplayer].camera, primaryLevel->LocalWorldTimer - min<int>(primaryLevel->LocalWorldTimer, worldTimer));
 			NetworkEntityManager::VerifyPredictedEntities();
 		}
 
@@ -2825,7 +2912,8 @@ void TryRunTics()
 	LastGameUpdate = EnterTic;
 
 	// Run the available tics.
-	P_UnPredictClient();
+	if (playeringame[consoleplayer])
+		P_UnPredictClient();
 	while (runTics--)
 	{
 		const bool stabilize = ShouldStabilizeTick();
@@ -2848,16 +2936,21 @@ void TryRunTics()
 			break;
 		}
 	}
-	P_PredictClient();
+	if (playeringame[consoleplayer])
+		P_PredictClient();
 
 	// These should use the actual tics since they're not actually tied to the gameplay logic.
 	// Make sure it always comes after so the HUD has the correct game state when updating.
-	for (int i = 0; i < totalTics; ++i)
-		P_RunClientSideLogic();
+	if (!dedicatedServer)
+	{
+		for (int i = 0; i < totalTics; ++i)
+			P_RunClientSideLogic();
+	}
 
 	// Since the level could get reset mid-tick, make sure the smaller of the two values is used
 	// since it should only go up otherwise.
-	S_UpdateSounds(players[consoleplayer].camera, primaryLevel->LocalWorldTimer - min<int>(primaryLevel->LocalWorldTimer, worldTimer));
+	if (playeringame[consoleplayer])
+		S_UpdateSounds(players[consoleplayer].camera, primaryLevel->LocalWorldTimer - min<int>(primaryLevel->LocalWorldTimer, worldTimer));
 	NetworkEntityManager::VerifyPredictedEntities();
 }
 

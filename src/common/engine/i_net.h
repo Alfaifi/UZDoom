@@ -33,6 +33,7 @@ inline constexpr size_t MAXPLAYERS = 64u;
 
 EXTERN_FARG(host);
 EXTERN_FARG(join);
+EXTERN_FARG(dedicated);
 
 enum ENetConstants
 {

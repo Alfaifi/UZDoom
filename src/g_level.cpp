@@ -503,7 +503,8 @@ void G_NewInit ()
 void G_DoNewGame (void)
 {
 	G_NewInit ();
-	playeringame[consoleplayer] = 1;
+	if (!dedicatedServer)
+		playeringame[consoleplayer] = 1;
 	if (d_skill != -1)
 	{
 		gameskill = d_skill;
@@ -636,7 +637,11 @@ void G_InitNew (const char *mapname, bool bTitleLevel)
 
 		// force players to be initialized upon first level load
 		for (i = 0; i < MAXPLAYERS; i++)
+		{
+			if (dedicatedServer && (int)i == consoleplayer)
+				continue;
 			players[i].playerstate = PST_ENTER;	// [BC]
+		}
 
 		STAT_StartNewGame(mapname);
 		GameUUID = GenerateUUID();
@@ -1530,7 +1535,8 @@ void FLevelLocals::DoLoadLevel(const FString &nextmapname, int position, bool au
 		Behaviors.StartTypedScripts(SCRIPT_Reopen, NULL, false);
 	}
 
-	StatusBar->AttachToPlayer (&players[consoleplayer]);
+	if (playeringame[consoleplayer])
+		StatusBar->AttachToPlayer (&players[consoleplayer]);
 	//      unsafe world load
 	staticEventManager.WorldLoaded();
 	//      regular world load (savegames are handled internally)

@@ -68,6 +68,7 @@ typedef int SOCKET;
 #define Sleep(x)			usleep (x * 1000)
 #define WSAEWOULDBLOCK		EWOULDBLOCK
 #define WSAECONNRESET		ECONNRESET
+#define WSAECONNREFUSED		ECONNREFUSED
 #define WSAGetLastError()	errno
 #endif
 
@@ -96,6 +97,9 @@ FARG(dup, "Multiplayer", "Send less player movement commands over the network.",
 FARG(port, "Multiplayer", "Specifies an alternative IP port for a network game.", "x",
 	"Specifies an alternate IP port for this machine to use during a network game. By default,"
 	" port 5029 is used.");
+FARG(dedicated, "Multiplayer", "Runs the game as a headless dedicated server.", "",
+	"The server operates without a window, sound, or input. It uses player slot 0 but does not"
+	" spawn an actor or participate in gameplay. Must be combined with -host.");
 FARG(password, "", "", "",
 	"");
 
@@ -331,17 +335,38 @@ static void I_NetLog(const char* text, ...)
 #endif
 }
 
+static bool IsDedicatedServer()
+{
+	static int cached = -1;
+	if (cached < 0)
+		cached = Args->CheckParm(FArg_dedicated) != 0;
+	return cached != 0;
+}
+
+static bool UseNetStartWindow()
+{
+#ifdef __APPLE__
+	// On macOS Cocoa, ZWidget's SDL2 RunLoop conflicts with the NSApplication
+	// event processing and crashes. All lobby modes use console-only output.
+	return false;
+#else
+	return !IsDedicatedServer();
+#endif
+}
+
 // Gracefully closes the net window so that any error messaging can be properly displayed.
 static void I_NetError(const char* error)
 {
-	NetStartWindow::NetClose();
+	if (UseNetStartWindow())
+		NetStartWindow::NetClose();
 	I_FatalError("%s", error);
 }
 
 static void I_NetInit(const char* msg, bool host)
 {
 	Printf("NetLobby:: %s\n", msg);
-	NetStartWindow::NetInit(msg, host);
+	if (UseNetStartWindow())
+		NetStartWindow::NetInit(msg, host);
 }
 
 // todo: later these must be dispatched by the main menu, not the start screen.
@@ -349,14 +374,32 @@ static void I_NetInit(const char* msg, bool host)
 static void I_NetMessage(const char* msg)
 {
 	Printf("NetLobby:: %s\n", msg);
-	NetStartWindow::NetMessage(msg);
+	if (UseNetStartWindow())
+		NetStartWindow::NetMessage(msg);
 }
 
 // Listen for incoming connections while the lobby is active. The main thread needs to be locked up
 // here to prevent the engine from continuing to start the game until everyone is ready.
 static bool I_NetLoop(bool (*loopCallback)(void*), void* data)
 {
+#ifdef __APPLE__
+	// On macOS Cocoa, ZWidget's RunLoop (SDL_WaitEvent / SDL_PollEvent)
+	// conflicts with the NSApplication event processing, causing a crash.
+	// Bypass it entirely with a direct polling loop. The NetStartWindow
+	// is still created and updated through the I_Net* calls — we just
+	// don't use its modal RunLoop.
+	while (!loopCallback(data))
+		Sleep(28); // ~35Hz polling rate matches TICRATE
+	return true;
+#else
+	if (!UseNetStartWindow())
+	{
+		while (!loopCallback(data))
+			Sleep(28);
+		return true;
+	}
 	return NetStartWindow::NetLoop(loopCallback, data);
+#endif
 }
 
 // A new client has just entered the game, so add them to the player list.
@@ -364,41 +407,51 @@ static void I_NetClientConnected(int client, unsigned int charLimit = 0u)
 {
 	Printf("NetLobby:: Client '%s' connected.\n", Net_GetClientName(client, 0u));
 
-	const char* name = Net_GetClientName(client, charLimit);
-	unsigned int flags = CFL_NONE;
-	if (client == 0)
-		flags |= CFL_HOST;
-	if (client == consoleplayer)
-		flags |= CFL_CONSOLEPLAYER;
+	if (UseNetStartWindow())
+	{
+		const char* name = Net_GetClientName(client, charLimit);
+		unsigned int flags = CFL_NONE;
+		if (client == 0)
+			flags |= CFL_HOST;
+		if (client == consoleplayer)
+			flags |= CFL_CONSOLEPLAYER;
 
-	NetStartWindow::NetConnect(client, name, flags, Connected[client].Status);
+		NetStartWindow::NetConnect(client, name, flags, Connected[client].Status);
+	}
 }
 
 // A client changed ready state.
 static void I_NetClientUpdated(int client)
 {
-	NetStartWindow::NetUpdate(client, Connected[client].Status);
+	if (UseNetStartWindow())
+		NetStartWindow::NetUpdate(client, Connected[client].Status);
 }
 
 static void I_NetClientDisconnected(int client)
 {
 	Printf("NetLobby:: Client '%s' disconnected.\n", Net_GetClientName(client, 0u));
-	NetStartWindow::NetDisconnect(client);
+	if (UseNetStartWindow())
+		NetStartWindow::NetDisconnect(client);
 }
 
 static void I_NetUpdatePlayers(int current, int limit)
 {
-	NetStartWindow::NetProgress(current, limit);
+	if (UseNetStartWindow())
+		NetStartWindow::NetProgress(current, limit);
 }
 
 static bool I_ShouldStartNetGame()
 {
+	if (!UseNetStartWindow())
+		return false; // Dedicated/macOS: wait for all players; use smaller -host N for fewer
 	return NetStartWindow::ShouldStartNet();
 }
 
 static void I_GetKickClients(TArray<int>& clients)
 {
 	clients.Clear();
+	if (!UseNetStartWindow())
+		return;
 
 	int c = -1;
 	while ((c = NetStartWindow::GetNetKickClient()) != -1)
@@ -408,6 +461,8 @@ static void I_GetKickClients(TArray<int>& clients)
 static void I_GetBanClients(TArray<int>& clients)
 {
 	clients.Clear();
+	if (!UseNetStartWindow())
+		return;
 
 	int c = -1;
 	while ((c = NetStartWindow::GetNetBanClient()) != -1)
@@ -416,7 +471,8 @@ static void I_GetBanClients(TArray<int>& clients)
 
 void I_NetDone()
 {
-	NetStartWindow::NetDone();
+	if (UseNetStartWindow())
+		NetStartWindow::NetDone();
 }
 
 void I_ClearClient(size_t client)
@@ -493,7 +549,7 @@ static void GetPacket(sockaddr_in* const from = nullptr)
 	if (client >= 0 && msgSize == SOCKET_ERROR)
 	{
 		int err = WSAGetLastError();
-		if (err == WSAECONNRESET)
+		if (err == WSAECONNRESET || err == WSAECONNREFUSED)
 		{
 			if (consoleplayer == -1)
 			{

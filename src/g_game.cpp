@@ -158,6 +158,7 @@ bool 			noblit; 				// for comparative timing purposes
 
 bool	 		viewactive;
 
+bool			dedicatedServer;				// Running as headless dedicated server
 bool			multiplayernext = false;		// [SP] Map coop/dm implementation
 player_t		players[MAXPLAYERS];
 bool			playeringame[MAXPLAYERS];

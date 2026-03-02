@@ -29,6 +29,7 @@
 #include "c_cvars.h"
 #include "c_dispatch.h"
 #include "d_eventbase.h"
+#include "doomstat.h"
 #include "c_buttons.h"
 #include "d_gui.h"
 #include "dikeys.h"
@@ -166,6 +167,7 @@ void I_GetEvent()
 
 void I_StartTic()
 {
+	if (dedicatedServer) return;
 	CheckGUICapture();
 	CheckNativeMouse();
 
@@ -175,6 +177,7 @@ void I_StartTic()
 
 void I_StartFrame()
 {
+	if (dedicatedServer) return;
 }
 
 
