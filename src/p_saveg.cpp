@@ -691,12 +691,12 @@ void FLevelLocals::ReadOnePlayer(FSerializer &arc, bool fromHub)
 
 		if (!fromHub)
 		{
-			// This temp player has undefined pitch limits, so set them to something
-			// that should leave the pitch stored in the savegame intact when
-			// rendering. The real pitch limits will be set by P_SerializePlayers()
-			// via a net command, but that won't be processed in time for a screen
-			// wipe, so we need something here.
-			temp.MaxPitch = temp.MinPitch = temp.mo->Angles.Pitch;
+			// This temp player has undefined pitch limits.  Use the full
+			// hardware-renderer range as a safe default so remote players
+			// are never locked to their current pitch.  The real limits
+			// arrive via DEM_SETPITCHLIMIT from each client's console.
+			temp.MinPitch = DAngle::fromDeg(-90.0);
+			temp.MaxPitch = DAngle::fromDeg(90.0);
 			CopyPlayer(Players[i], &temp, name.GetChars());
 		}
 		else
@@ -969,6 +969,7 @@ void FLevelLocals::Serialize(FSerializer &arc, bool hubload)
 		("aircontrol", aircontrol)
 		("teamdamage", teamdamage)
 		("maptime", maptime)
+		("time", time)
 		("totaltime", i)
 		("skytexture1", skytexture1)
 		("skytexture2", skytexture2)

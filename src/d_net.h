@@ -161,6 +161,9 @@ double Net_ModifyFrac(double ticFrac);
 double Net_ModifyObjectFrac(DObject* obj, double ticFrac);
 double Net_ModifyParticleFrac(particle_t* part, double ticFrac);
 
+// True on clients connected to a dedicated server (host player 0 is a ghost).
+extern bool					hostIsDedicated;
+
 // Netgame stuff (buffers and pointers, i.e. indices).
 
 extern usercmd_t			LocalCmds[LOCALCMDTICS];
@@ -213,5 +216,60 @@ void HandleMidgameAccept();
 void HandleMidgameReject();
 void HandleMidgamePlayerJoin();
 void HandleMidgamePlayerAck();
+
+// Mid-game state transfer handlers
+void HandleMidgameStateBegin();
+void HandleMidgameStateChunk();
+void HandleMidgameStateChunkAck();
+void HandleMidgameStateComplete();
+void HandleMidgameStateLoaded();
+void HandleMidgameStateError();
+
+void Net_PrepareMidgameSync();
+extern struct FStateTransferRecv IncomingStateTransfer;
+
+// Chunk size for mid-game state transfer (fits in MaxTransmitSize after headers + compression).
+constexpr size_t STATE_CHUNK_PAYLOAD = 6000u;
+constexpr int STATE_TRANSFER_TIMEOUT_MS = 500;
+constexpr int STATE_TRANSFER_MAX_RETRIES = 20;
+constexpr uint64_t STATE_TRANSFER_TOTAL_TIMEOUT_MS = 60000;	// Abort entire transfer after 60 seconds
+
+// Host-side: tracks outgoing state transfer to a joining client.
+struct FStateTransferSend
+{
+	bool		active = false;
+	int			clientNum = -1;
+	TArray<uint8_t>	data;			// Globals + snapshot, concatenated
+	size_t		globalsSize = 0;	// Size of globals portion within data
+	FString		mapName;
+	int			hostGametic = 0;
+	int			hostConsistency = 0;
+	uint8_t		hostLobbyID = 0;
+	size_t		numChunks = 0;
+	size_t		nextChunkToSend = 0;
+	uint64_t	lastSendTime = 0;
+	uint64_t	transferStartTime = 0;	// Time when transfer began (for total timeout)
+	int			retryCount = 0;
+
+	void Clear() { *this = FStateTransferSend{}; }
+};
+
+// Client-side: tracks incoming state transfer from the host.
+struct FStateTransferRecv
+{
+	bool		active = false;
+	bool		loadedSent = false;	// True after STATE_LOADED was sent to host
+	TArray<uint8_t>	data;			// Reassembly buffer
+	size_t		totalSize = 0;
+	size_t		globalsSize = 0;
+	FString		mapName;
+	int			hostGametic = 0;
+	int			hostConsistency = 0;
+	uint8_t		hostLobbyID = 0;
+	size_t		numChunks = 0;
+	size_t		nextExpectedChunk = 0;
+
+	void Clear() { *this = FStateTransferRecv{}; }
+};
 
 #endif

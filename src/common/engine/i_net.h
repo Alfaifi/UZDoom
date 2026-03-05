@@ -152,6 +152,15 @@ enum ENetConnectType : uint8_t
 	PRE_MIDGAME_REJECT,		// Host -> New client: "Cannot join" + reason
 	PRE_MIDGAME_PLAYER_JOIN,// Host -> All existing: "Player N is joining"
 	PRE_MIDGAME_PLAYER_ACK,	// All -> Host: "Acknowledged new player"
+
+	// Mid-game state transfer (snapshot-based)
+	PRE_MIDGAME_STATE_BEGIN,	// Host -> Joiner: metadata (map, sizes, gametic)
+	PRE_MIDGAME_STATE_CHUNK,	// Host -> Joiner: one chunk of state data
+	PRE_MIDGAME_STATE_CHUNK_ACK,// Joiner -> Host: ACK for chunk N
+	PRE_MIDGAME_STATE_COMPLETE,	// Host -> Joiner: all chunks sent
+	PRE_MIDGAME_STATE_READY,	// Joiner -> Host: initialized, ready for state
+	PRE_MIDGAME_STATE_LOADED,	// Joiner -> Host: snapshot loaded successfully
+	PRE_MIDGAME_STATE_ERROR,	// Joiner -> Host: error, abort transfer
 };
 
 enum EMidgameRejectReason : uint8_t
@@ -169,5 +178,8 @@ void CloseNetwork();
 void I_SetClientAddress(int client);
 void I_SendSetupPacket(int client, const uint8_t* data, size_t size);
 void I_SendSetupPacketToAddress(const uint8_t* data, size_t size);
+void I_GetGameID(uint8_t out[8]);
+void I_SetGameID(const uint8_t in[8]);
+bool I_IsAddressBanned();
 
 #endif

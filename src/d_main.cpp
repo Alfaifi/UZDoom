@@ -1106,7 +1106,11 @@ void D_Display ()
 
 	if (nodrawers || screen == NULL)
 		return; 				// for comparative timing / profiling
-	
+
+	// Mid-game joiner: don't render until DEM_MIDGAMESPAWN fires and spawns our actor.
+	if (consoleplayer < 0 || !playeringame[consoleplayer])
+		return;
+
 	if (!AppActive && !setmodeneeded && !vid_activeinbackground)
 	{
 		return;
@@ -1438,8 +1442,8 @@ void D_DoomLoop ()
 	{
 		try
 		{
-			if (playeringame[consoleplayer])
-			GStrings.SetDefaultGender(players[consoleplayer].userinfo.GetGender()); // cannot be done when the CVAR changes because we don't know if it's for the consoleplayer.
+			if (!dedicatedServer && consoleplayer >= 0 && playeringame[consoleplayer])
+				GStrings.SetDefaultGender(players[consoleplayer].userinfo.GetGender()); // cannot be done when the CVAR changes because we don't know if it's for the consoleplayer.
 
 			// frame syncronous IO operations
 			if (gametic > lasttic)
@@ -1454,7 +1458,8 @@ void D_DoomLoop ()
 			I_StartTic ();
 			D_ProcessEvents();
 			D_Display ();
-			S_UpdateMusic();
+			if (!dedicatedServer)
+				S_UpdateMusic();
 
 			if (gameloop_abort)
 			{
@@ -3896,7 +3901,8 @@ static int D_InitGame(const FIWADInfo* iwad_info, std::vector<FileSys::ResourceN
 			}
 			else
 			{
-				if (gameaction != ga_loadgame && gameaction != ga_loadgamehidecon)
+				if (gameaction != ga_loadgame && gameaction != ga_loadgamehidecon
+					&& gameaction != ga_midgamejoin)
 				{
 					if (autostart || netgame)
 					{

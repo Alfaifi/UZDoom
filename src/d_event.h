@@ -98,6 +98,7 @@ enum gameaction_t : int
 	ga_titleloop,
 	ga_mapwarp,
 	ga_quicksave,
+	ga_midgamejoin,
 };
 
 extern	gameaction_t	gameaction;

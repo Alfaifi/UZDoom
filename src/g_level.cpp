@@ -503,8 +503,7 @@ void G_NewInit ()
 void G_DoNewGame (void)
 {
 	G_NewInit ();
-	if (!dedicatedServer)
-		playeringame[consoleplayer] = 1;
+	playeringame[consoleplayer] = 1;
 	if (d_skill != -1)
 	{
 		gameskill = d_skill;
@@ -638,8 +637,6 @@ void G_InitNew (const char *mapname, bool bTitleLevel)
 		// force players to be initialized upon first level load
 		for (i = 0; i < MAXPLAYERS; i++)
 		{
-			if (dedicatedServer && (int)i == consoleplayer)
-				continue;
 			players[i].playerstate = PST_ENTER;	// [BC]
 		}
 

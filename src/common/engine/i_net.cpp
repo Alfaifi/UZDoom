@@ -103,6 +103,14 @@ FARG(dedicated, "Multiplayer", "Runs the game as a headless dedicated server.", 
 FARG(password, "", "", "",
 	"");
 
+EXTERN_CVAR(Bool, net_allowjoin)
+CUSTOM_CVAR(Bool, net_forcestart, false, CVAR_SERVERINFO | CVAR_NOSAVE)
+{
+	// Force-starting alone only makes sense if mid-game joining is enabled.
+	if (self && !net_allowjoin)
+		net_allowjoin = true;
+}
+
 // As per http://support.microsoft.com/kb/q192599/ the standard
 // size for network buffers is 8k.
 constexpr size_t MaxTransmitSize = 8000u;
@@ -164,6 +172,7 @@ static FConnection	Connected[MAXPLAYERS] = {};
 static uint8_t		TransmitBuffer[MaxTransmitSize] = {};
 static TArray<sockaddr_in> BannedConnections = {};
 static bool bGameStarted = false;
+static bool bMidgameJoining = false;	// Client is attempting to join an in-progress game.
 static sockaddr_in LastUnknownAddress = {};	// Address of last unknown client (for mid-game join replies).
 
 // Forward declarations for disconnect/migration/join handlers defined in d_net.cpp.
@@ -182,6 +191,13 @@ extern void HandleMidgameAccept();
 extern void HandleMidgameReject();
 extern void HandleMidgamePlayerJoin();
 extern void HandleMidgamePlayerAck();
+extern void HandleMidgameStateBegin();
+extern void HandleMidgameStateChunk();
+extern void HandleMidgameStateChunkAck();
+extern void HandleMidgameStateComplete();
+extern void HandleMidgameStateReady();
+extern void HandleMidgameStateLoaded();
+extern void HandleMidgameStateError();
 
 CUSTOM_CVAR(String, net_password, "", CVAR_IGNORE)
 {
@@ -294,6 +310,8 @@ static void StartNetwork(bool autoPort)
 
 void CloseNetwork()
 {
+	bMidgameJoining = false;
+
 	if (MySocket != INVALID_SOCKET)
 	{
 		closesocket(MySocket);
@@ -311,6 +329,26 @@ static void GenerateGameID()
 {
 	const uint64_t val = GameIDGen.GenRand64();
 	memcpy(GameID, &val, sizeof(val));
+}
+
+void I_GetGameID(uint8_t out[8])
+{
+	memcpy(out, GameID, 8);
+}
+
+void I_SetGameID(const uint8_t in[8])
+{
+	memcpy(GameID, in, 8);
+}
+
+bool I_IsAddressBanned()
+{
+	for (size_t i = 0; i < BannedConnections.Size(); ++i)
+	{
+		if (BannedConnections[i].sin_addr.s_addr == LastUnknownAddress.sin_addr.s_addr)
+			return true;
+	}
+	return false;
 }
 
 // Print a network-related message to the console. This doesn't print to the window so should
@@ -442,8 +480,10 @@ static void I_NetUpdatePlayers(int current, int limit)
 
 static bool I_ShouldStartNetGame()
 {
+	if (IsDedicatedServer() || net_forcestart)
+		return true; // Dedicated servers always force-start; net_forcestart overrides for P2P
 	if (!UseNetStartWindow())
-		return false; // Dedicated/macOS: wait for all players; use smaller -host N for fewer
+		return false; // macOS: wait for all players; use smaller -host N for fewer
 	return NetStartWindow::ShouldStartNet();
 }
 
@@ -577,7 +617,7 @@ static void GetPacket(sockaddr_in* const from = nullptr)
 			msgSize = 0;
 		}
 	}
-	else if (msgSize > 0)
+	else if (msgSize > 4) // Minimum: 4-byte CRC + at least 1 byte of data.
 	{
 		const uint8_t* dataStart = &TransmitBuffer[4];
 		if (client == -1 && !(*dataStart & NCMD_SETUP))
@@ -590,6 +630,38 @@ static void GetPacket(sockaddr_in* const from = nullptr)
 			// so mid-game join requests can reach HandleIncomingConnection().
 			// Store the address for reply since we don't have a Connected[] slot yet.
 			LastUnknownAddress = fromAddress;
+
+			// Validate CRC and decompress into NetBuffer (same as known-client path).
+			const uint32_t check = CalcCRC32(dataStart, msgSize - 4);
+			const uint32_t crc = (TransmitBuffer[0] << 24) | (TransmitBuffer[1] << 16) | (TransmitBuffer[2] << 8) | TransmitBuffer[3];
+			if (check != crc)
+			{
+				client = -1;
+				msgSize = 0;
+			}
+			else
+			{
+				NetBuffer[0] = (*dataStart & ~NCMD_COMPRESSED);
+				if (*dataStart & NCMD_COMPRESSED)
+				{
+					uLongf size = MAX_MSGLEN - 1;
+					int err = uncompress(NetBuffer + 1, &size, dataStart + 1, msgSize - 5);
+					if (err != Z_OK)
+					{
+						client = -1;
+						msgSize = 0;
+					}
+					else
+					{
+						msgSize = size + 1;
+					}
+				}
+				else
+				{
+					msgSize -= 4;
+					memcpy(NetBuffer + 1, dataStart + 1, msgSize - 1);
+				}
+			}
 		}
 		else
 		{
@@ -859,6 +931,43 @@ void HandleIncomingConnection()
 	case PRE_MIDGAME_PLAYER_ACK:
 		if (RemoteClient >= 0)
 			HandleMidgamePlayerAck();
+		return;
+
+	// Mid-game state transfer
+	case PRE_MIDGAME_STATE_BEGIN:
+		if (RemoteClient >= 0)
+			HandleMidgameStateBegin();
+		return;
+	case PRE_MIDGAME_STATE_CHUNK:
+		if (RemoteClient >= 0)
+			HandleMidgameStateChunk();
+		return;
+	case PRE_MIDGAME_STATE_CHUNK_ACK:
+		if (RemoteClient >= 0)
+			HandleMidgameStateChunkAck();
+		return;
+	case PRE_MIDGAME_STATE_COMPLETE:
+		if (RemoteClient >= 0)
+			HandleMidgameStateComplete();
+		return;
+	case PRE_MIDGAME_STATE_READY:
+		if (RemoteClient >= 0)
+			HandleMidgameStateReady();
+		return;
+	case PRE_MIDGAME_STATE_LOADED:
+		if (RemoteClient >= 0)
+			HandleMidgameStateLoaded();
+		return;
+	case PRE_MIDGAME_STATE_ERROR:
+		if (RemoteClient >= 0)
+			HandleMidgameStateError();
+		return;
+
+	// Lobby PRE_CONNECT received during gameplay: tell client the game is in progress.
+	// They should retry with PRE_MIDGAME_CONNECT if mid-game join is supported.
+	case PRE_CONNECT:
+		if (bGameStarted && consoleplayer == Net_Arbitrator)
+			RejectConnection(LastUnknownAddress, PRE_IN_PROGRESS);
 		return;
 
 	// Existing lobby behavior: resend PRE_GO to ready clients
@@ -1153,13 +1262,17 @@ static bool HostGame(int arg)
 	I_NetDone();
 
 	// If the player force started with only themselves in the lobby, start the game
-	// immediately.
+	// immediately. If net_forcestart is set, keep the network open for mid-game joiners.
 	if (connectedPlayers == 1)
 	{
-		CloseNetwork();
-		MaxClients = 1;
-		TicDup = 1u;
-		return true;
+		if (!IsDedicatedServer() && !net_forcestart)
+		{
+			CloseNetwork();
+			MaxClients = 1;
+			TicDup = 1u;
+			return true;
+		}
+		// Dedicated/force-start: keep network open for mid-game joiners.
 	}
 
 	I_NetLog("Go");
@@ -1280,7 +1393,9 @@ static bool Guest_ContactHost(void* unused)
 		}
 		else if (NetBuffer[1] == PRE_IN_PROGRESS)
 		{
-			I_NetError("The game has already started");
+			// Game is already in progress. Switch to mid-game join protocol.
+			bMidgameJoining = true;
+			I_NetMessage("Game in progress, attempting mid-game join...");
 		}
 		else if (NetBuffer[1] == PRE_WRONG_PASSWORD)
 		{
@@ -1386,10 +1501,36 @@ static bool Guest_ContactHost(void* unused)
 			I_NetLog("Received GO");
 			return true;
 		}
+		// Mid-game join responses
+		else if (NetBuffer[1] == PRE_MIDGAME_ACCEPT)
+		{
+			HandleMidgameAccept();
+			I_NetMessage("Accepted, joining game...");
+			// Exit lobby immediately. State transfer happens in D_DoomLoop
+			// after V_Init2/shader compilation, minimizing the snapshot gap.
+			// HandleMidgameAccept sets gameaction = ga_midgamejoin.
+			return true;
+		}
+		else if (NetBuffer[1] == PRE_MIDGAME_REJECT)
+		{
+			HandleMidgameReject();
+			I_NetError("Mid-game join rejected");
+		}
 	}
 
 	NetBuffer[0] = NCMD_SETUP;
-	if (consoleplayer == -1)
+	if (consoleplayer == -1 && bMidgameJoining)
+	{
+		// Mid-game join: send PRE_MIDGAME_CONNECT with engine info + password.
+		NetBuffer[1] = PRE_MIDGAME_CONNECT;
+		uint8_t* engineInfo = &NetBuffer[2];
+		const size_t end = 2u + Net_SetEngineInfo(engineInfo);
+		const size_t passSize = strlen(net_password) + 1;
+		memcpy(&NetBuffer[end], net_password, passSize);
+		NetBufferLength = end + passSize;
+		SendPacket(Connected[0].Address);
+	}
+	else if (consoleplayer == -1)
 	{
 		NetBuffer[1] = PRE_CONNECT;
 		uint8_t* engineInfo = &NetBuffer[2];
