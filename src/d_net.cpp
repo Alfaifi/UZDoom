@@ -609,7 +609,7 @@ void Net_ResetCommands(bool midTic)
 	for (auto client : NetworkClients)
 	{
 		auto& state = ClientStates[client];
-		state.Flags &= CF_QUIT;
+		state.Flags &= (CF_QUIT | CF_JOINING | CF_AWAITING_STATE);
 		state.StabilityBuffer = 0u;
 		state.CurrentSequence = min<int>(state.CurrentSequence, tic);
 		state.SequenceAck = min<int>(state.SequenceAck, tic);
@@ -845,7 +845,8 @@ static void ClientQuit(int clientNum, int newHost)
 
 	DisconnectClient(clientNum);
 	if (clientNum == Net_Arbitrator)
-		SetArbitrator(newHost >= 0 ? newHost : NetworkClients[0]);
+		SetArbitrator((newHost >= 0 && newHost < (int)MAXPLAYERS && NetworkClients.InGame(newHost))
+			? newHost : NetworkClients[0]);
 
 	if (demorecording)
 		G_CheckDemoStatus();
@@ -857,6 +858,8 @@ static void ClientQuit(int clientNum, int newHost)
 
 static void SendSetupPacketToClient(int client, uint8_t subtype, const uint8_t* extra = nullptr, size_t extraSize = 0)
 {
+	if (extraSize > MAX_MSGLEN - 2)
+		return;
 	uint8_t buf[MAX_MSGLEN];
 	buf[0] = NCMD_SETUP;
 	buf[1] = subtype;
@@ -871,6 +874,8 @@ static void SendSetupPacketToClient(int client, uint8_t subtype, const uint8_t* 
 
 static void SendSetupPacketToAll(uint8_t subtype, const uint8_t* extra = nullptr, size_t extraSize = 0, int excludeClient = -1)
 {
+	if (extraSize > MAX_MSGLEN - 2)
+		return;
 	uint8_t buf[MAX_MSGLEN];
 	buf[0] = NCMD_SETUP;
 	buf[1] = subtype;
@@ -932,11 +937,15 @@ void HandleDisconnectNotify()
 	if (RemoteClient != Net_Arbitrator)
 		return;
 
+	if (NetBufferLength < 3)
+		return;
+
 	const int nextHost = NetBuffer[2];
 	DPrintf(DMSG_NOTIFY, "Host is leaving, new host is client %d\n", nextHost);
 
 	DisconnectClient(RemoteClient);
-	SetArbitrator(nextHost >= 0 ? nextHost : NetworkClients[0]);
+	SetArbitrator((nextHost >= 0 && nextHost < (int)MAXPLAYERS && NetworkClients.InGame(nextHost))
+		? nextHost : NetworkClients[0]);
 
 	if (demorecording)
 		G_CheckDemoStatus();
@@ -1109,8 +1118,9 @@ void HandleMidgameConnect()
 	if (consoleplayer != Net_Arbitrator)
 		return;
 
-	// Mid-game join is dedicated server only (avoids P2P lockstep desync with 3+ players).
-	// Dedicated servers always allow join — no need for net_allowjoin CVAR.
+	// Mid-game join is allowed on dedicated servers by default.
+	// P2P hosts can enable it via net_allowjoin, but it may cause
+	// lockstep desync issues with 3+ players.
 	if (!dedicatedServer && !net_allowjoin)
 	{
 		uint8_t buf[3] = { NCMD_SETUP, PRE_MIDGAME_REJECT, REJECT_DISABLED };
@@ -1145,9 +1155,9 @@ void HandleMidgameConnect()
 		return;
 	}
 
-	// Find a free player slot (skip slot 0 — ghost player on dedicated server).
+	// Find a free player slot (skip slot 0 on dedicated server — ghost player).
 	int freeSlot = -1;
-	for (int i = 1; i < MaxClients; ++i)
+	for (int i = (dedicatedServer ? 1 : 0); i < MaxClients; ++i)
 	{
 		if (!NetworkClients.InGame(i))
 		{
@@ -1375,6 +1385,8 @@ static void BeginStateTransfer(int client)
 	if (!info || !info->Snapshot.mBuffer)
 	{
 		Printf("BeginStateTransfer: failed to create snapshot\n");
+		if (playeringame[consoleplayer] && !dedicatedServer)
+			P_PredictClient();
 		return;
 	}
 
@@ -1456,10 +1468,11 @@ static void AbortStateTransfer()
 		const int client = PendingStateTransfer.clientNum;
 		Printf("State transfer to client %d aborted\n", client);
 
-		// Clean up the joining client's slot so it doesn't remain in a zombie
-		// state with CF_JOINING/CF_AWAITING_STATE blocking the slot forever.
+		// Notify the joiner so they can exit ga_midgamejoin, then clean up
+		// the slot so it doesn't remain in a zombie state.
 		if (NetworkClients.InGame(client))
 		{
+			SendSetupPacketToClient(client, PRE_MIDGAME_STATE_ERROR);
 			ClientStates[client].Flags &= ~(CF_JOINING | CF_AWAITING_STATE);
 			DisconnectClient(client);
 		}
@@ -1605,6 +1618,10 @@ void HandleMidgameStateBegin()
 	deathmatch = (int)p[0];
 	p += 1;
 
+	// Validate that globalsSize fits within totalSize.
+	if (xfer.globalsSize > xfer.totalSize)
+		return;
+
 	// Validate that mapName is null-terminated within the remaining buffer.
 	const size_t remaining = NetBufferLength - (p - &NetBuffer[0]);
 	if (memchr(p, '\0', remaining) == nullptr)
@@ -1679,6 +1696,7 @@ void HandleMidgameStateComplete()
 		Printf("State transfer incomplete: expected %zu chunks, got %zu\n",
 			   xfer.numChunks, xfer.nextExpectedChunk);
 		xfer.Clear();
+		gameaction = ga_fullconsole;
 		return;
 	}
 
@@ -1771,7 +1789,7 @@ void HandleMidgameStateError()
 	else
 	{
 		Printf("Host reported state transfer error\n");
-		IncomingStateTransfer.Clear();
+		G_AbortMidgameJoin();
 	}
 }
 

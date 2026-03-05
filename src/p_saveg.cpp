@@ -757,6 +757,8 @@ void FLevelLocals::ReadMultiplePlayers(FSerializer &arc, int numPlayers, bool fr
 				// Found a match, so copy our temp player to the real player
 				if (!fromHub)
 				{
+					p.Info.MinPitch = DAngle::fromDeg(-90.0);
+					p.Info.MaxPitch = DAngle::fromDeg(90.0);
 					Printf("Found %s's (%d) data\n", Players[i]->userinfo.GetName(), i);
 					CopyPlayer(Players[i], &p.Info, p.Name.GetChars());
 				}
@@ -785,6 +787,8 @@ void FLevelLocals::ReadMultiplePlayers(FSerializer &arc, int numPlayers, bool fr
 			{
 				if (!fromHub)
 				{
+					p.Info.MinPitch = DAngle::fromDeg(-90.0);
+					p.Info.MaxPitch = DAngle::fromDeg(90.0);
 					Printf("Assigned %s (%d) to %s's data\n", Players[i]->userinfo.GetName(), i, p.Name.GetChars());
 					CopyPlayer(Players[i], &p.Info, p.Name.GetChars());
 				}

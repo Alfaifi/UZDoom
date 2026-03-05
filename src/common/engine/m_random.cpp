@@ -513,6 +513,8 @@ void FRandom::StaticReadRNGBinary(const uint8_t* data, size_t len)
 			if (rng->NameCRC == crc)
 			{
 				rng->idx = (int)uidx;
+				if (rng->idx < 0 || rng->idx > (int)SFMT::N32)
+					rng->idx = SFMT::N32; // force regeneration on next use
 				for (size_t j = 0; j < SFMT::N32; j++)
 					rng->sfmt.u[j] = ReadBE32(&p[j * 4]);
 				break;

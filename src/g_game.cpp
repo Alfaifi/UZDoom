@@ -2014,9 +2014,28 @@ bool CheckGZDoomSaveCompat(FString &engine, FString &software);
 //==========================================================================
 
 static bool bMidgameStateRequested = false;
+static uint64_t midgameJoinStartTime = 0;
+
+void G_AbortMidgameJoin()
+{
+	gameaction = ga_fullconsole;
+	bMidgameStateRequested = false;
+	midgameJoinStartTime = 0;
+	IncomingStateTransfer.Clear();
+}
 
 void G_DoMidgameJoin()
 {
+	// Timeout: if the host hasn't completed the transfer within 90 seconds,
+	// give up. This is slightly longer than the host's 60s transfer timeout
+	// so the host can abort first under normal conditions.
+	if (midgameJoinStartTime > 0 && (I_msTime() - midgameJoinStartTime) >= 90000)
+	{
+		Printf("Mid-game join timed out (no response from host)\n");
+		G_AbortMidgameJoin();
+		return;
+	}
+
 	auto& xfer = IncomingStateTransfer;
 	if (xfer.data.Size() == 0)
 	{
@@ -2029,6 +2048,7 @@ void G_DoMidgameJoin()
 			uint8_t buf[2] = { NCMD_SETUP, PRE_MIDGAME_STATE_READY };
 			I_SendSetupPacket(Net_Arbitrator, buf, 2);
 			bMidgameStateRequested = true;
+			midgameJoinStartTime = I_msTime();
 		}
 		return;
 	}
@@ -2042,6 +2062,7 @@ void G_DoMidgameJoin()
 	// State data fully received — proceed with loading.
 	gameaction = ga_nothing;
 	bMidgameStateRequested = false;
+	midgameJoinStartTime = 0;
 
 	Printf("Loading mid-game state for %s...\n", xfer.mapName.GetChars());
 
