@@ -103,7 +103,7 @@ static const struct ColorList {
 static void FreeParticle(FLevelLocals* Level, particle_t* particle)
 {
 	auto prev = particle->tprev == NO_PARTICLE? nullptr : &Level->Particles[particle->tprev];
-	int pindex = (int)(particle - Level->Particles.Data());
+	uint32_t pindex = (uint32_t)(particle - Level->Particles.Data());
 	auto tnext = particle->tnext;
 	assert(!prev || (prev->tnext == pindex));
 	if (prev)

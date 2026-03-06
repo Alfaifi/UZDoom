@@ -63,7 +63,7 @@ PlayGamePage::PlayGamePage(LauncherWindow* launcher, const FStartupSelectionInfo
 		GamesList->ScrollToItem(info.DefaultIWAD);
 	}
 
-	GamesList->OnActivated = [=]() { OnGamesListActivated(); };
+	GamesList->OnActivated = [this]() { OnGamesListActivated(); };
 }
 
 void PlayGamePage::SetValues(FStartupSelectionInfo& info) const

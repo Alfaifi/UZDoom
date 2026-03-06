@@ -609,7 +609,7 @@ SortNode * HWDrawList::SortSpriteList(SortNode * head)
 
 	sortspritelist.Clear();
 	for(count=0,n=head;n;n=n->next) sortspritelist.Push(n);
-	std::stable_sort(sortspritelist.begin(), sortspritelist.end(), [=](SortNode *a, SortNode *b)
+	std::stable_sort(sortspritelist.begin(), sortspritelist.end(), [this](SortNode *a, SortNode *b)
 	{
 		return CompareSprites(a, b) < 0;
 	});

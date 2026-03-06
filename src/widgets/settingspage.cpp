@@ -126,7 +126,7 @@ SettingsPage::SettingsPage(LauncherWindow* launcher, const FStartupSelectionInfo
 			LangList->SetSelectedItem(i);
 		++i;
 	}
-	LangList->OnChanged = [=](int i) { OnLanguageChanged(i); };
+	LangList->OnChanged = [this](int i) { OnLanguageChanged(i); };
 
 	ExtraWadFlags = 0;
 
