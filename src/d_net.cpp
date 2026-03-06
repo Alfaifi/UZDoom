@@ -1222,9 +1222,19 @@ void HandleMidgameConnect()
 
 	// Append server CVARs (dmflags, compatflags, etc.) so the joiner
 	// has the same settings as lobby joiners (via PRE_GAME_INFO).
-	TArrayView<uint8_t> cvarStream = TArrayView(&buf[pos], MAX_MSGLEN - pos);
-	C_WriteCVars(cvarStream, CVAR_SERVERINFO, true);
-	pos += cvarStream.Data() - &buf[pos];
+	// Pre-check size to avoid I_Error if CVARs exceed the remaining buffer.
+	FString cvarDump = C_GetMassCVarString(CVAR_SERVERINFO, true);
+	const size_t cvarNeeded = cvarDump.Len() + 1; // null terminator
+	if (pos + cvarNeeded <= MAX_MSGLEN)
+	{
+		TArrayView<uint8_t> cvarStream = TArrayView(&buf[pos], MAX_MSGLEN - pos);
+		C_WriteCVars(cvarStream, CVAR_SERVERINFO, true);
+		pos += cvarStream.Data() - &buf[pos];
+	}
+	else
+	{
+		Printf("HandleMidgameConnect: CVAR data too large (%zu bytes), sending without\n", cvarNeeded);
+	}
 
 	I_SendSetupPacketToAddress(buf, pos);
 
@@ -3687,6 +3697,8 @@ void TryRunTics()
 		{
 			if (!dedicatedServer && playeringame[consoleplayer])
 				S_UpdateSounds(players[consoleplayer].camera, primaryLevel->LocalWorldTimer - min<int>(primaryLevel->LocalWorldTimer, worldTimer));
+			if (!dedicatedServer)
+				NetworkEntityManager::VerifyPredictedEntities();
 		}
 
 		return;
@@ -3740,6 +3752,8 @@ void TryRunTics()
 	// since it should only go up otherwise.
 	if (!dedicatedServer && playeringame[consoleplayer])
 		S_UpdateSounds(players[consoleplayer].camera, primaryLevel->LocalWorldTimer - min<int>(primaryLevel->LocalWorldTimer, worldTimer));
+	if (!dedicatedServer)
+		NetworkEntityManager::VerifyPredictedEntities();
 }
 
 void Net_NewClientTic()
