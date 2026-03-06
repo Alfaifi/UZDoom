@@ -219,6 +219,7 @@ public:
 	static std::unique_ptr<DisplayBackend> TryCreateSDL2();
 	static std::unique_ptr<DisplayBackend> TryCreateX11();
 	static std::unique_ptr<DisplayBackend> TryCreateWayland();
+	static std::unique_ptr<DisplayBackend> TryCreateNull();
 
 	static std::unique_ptr<DisplayBackend> TryCreateBackend();
 

@@ -161,7 +161,9 @@ enum EDemoCommand
 	DEM_KICK,			// 76 Byte: Player number
 	DEM_READIED,		// 77
 	DEM_WEAPSELECT,		// 78 Byte: Slot
-	DEM_USEFLECHETTE,	// 79	
+	DEM_USEFLECHETTE,	// 79
+	DEM_MIDGAMESPAWN,	// 80 Byte: Player number to spawn mid-game
+	DEM_PLAYERDISCONNECT,	// 81 Byte: Player number to remove deterministically
 };
 
 // The following are implemented by cht_DoCheat in m_cheat.cpp

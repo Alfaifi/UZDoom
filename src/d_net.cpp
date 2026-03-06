@@ -30,10 +30,12 @@
 #include "d_eventbase.h"
 #include "d_main.h"
 #include "d_net.h"
+#include "doomstat.h"
 #include "d_netinf.h"
 #include "events.h"
 #include "g_game.h"
 #include "g_levellocals.h"
+#include "g_mapinfo.h"
 #include "gameconfigfile.h"
 #include "gi.h"
 #include "gstrings.h"
@@ -65,11 +67,15 @@ EXTERN_CVAR (Int, autosavecount)
 EXTERN_CVAR (Bool, cl_capfps)
 EXTERN_CVAR (Bool, vid_vsync)
 EXTERN_CVAR (Int, vid_maxfps)
+EXTERN_CVAR (Bool, cl_noprediction)
+EXTERN_CVAR (String, net_password)
 
 EXTERN_FARG(loadgame);
 
 FARG(extratic, "Multiplayer", "Sends backup commands over the network", "",
 	"Causes " GAMENAME " to send a backup copy of every movement command across the network.");
+
+FVerificationError Net_VerifyEngine(uint8_t*& stream, size_t& offset);
 
 extern uint8_t		*demo_p;		// [RH] Special "ticcmds" get recorded in demos
 extern FString	savedescription;
@@ -78,6 +84,31 @@ extern FString	savegamefile;
 extern bool AppActive;
 
 void P_ClearLevelInterpolation();
+
+// Big-endian read/write helpers for network packet serialization.
+static inline void WriteBE32(uint8_t* p, uint32_t v)
+{
+	p[0] = (v >> 24) & 0xFF;
+	p[1] = (v >> 16) & 0xFF;
+	p[2] = (v >> 8) & 0xFF;
+	p[3] = v & 0xFF;
+}
+
+static inline void WriteBE16(uint8_t* p, uint16_t v)
+{
+	p[0] = (v >> 8) & 0xFF;
+	p[1] = v & 0xFF;
+}
+
+static inline uint32_t ReadBE32(const uint8_t* p)
+{
+	return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3];
+}
+
+static inline uint16_t ReadBE16(const uint8_t* p)
+{
+	return ((uint16_t)p[0] << 8) | p[1];
+}
 
 enum ELevelStartStatus
 {
@@ -165,6 +196,9 @@ static bool		bHasPendingMigration = false;	// True if we received migration stat
 constexpr int		DISCONNECT_TIMEOUT_MS = 500;	// Retry disconnect request/notify after this many ms.
 constexpr int		DISCONNECT_MAX_RETRIES = 8;		// Give up after this many retries (4 seconds total).
 constexpr uint64_t	CLIENT_TIMEOUT_MS = 10000;		// Treat client as disconnected after 10 seconds of silence.
+
+// Client-side: set when the host is a dedicated server (slot 0 is ghost).
+bool				hostIsDedicated = false;
 
 void D_ProcessEvents(void); 
 void G_BuildTiccmd(usercmd_t *cmd);
@@ -412,6 +446,7 @@ void Net_ClearBuffers()
 	LagState = LAG_NONE;
 	MutedClients = 0u;
 	CurrentLobbyID = 0u;
+	hostIsDedicated = false;
 	NetworkClients.Clear();
 	netgame = multiplayer = false;
 	LastSentConsistency = CurrentConsistency = 0;
@@ -452,6 +487,10 @@ bool Net_IsPlayerReady(int player)
 		if (type == ST_UNSKIPPABLE)
 			return false;
 	}
+
+	// Ghost player on dedicated servers is always ready (no human to press buttons).
+	if ((dedicatedServer || hostIsDedicated) && player == 0)
+		return true;
 
 	return players[player].Bot != nullptr || (CutsceneReady & ((uint64_t)1u << player));
 }
@@ -570,7 +609,7 @@ void Net_ResetCommands(bool midTic)
 	for (auto client : NetworkClients)
 	{
 		auto& state = ClientStates[client];
-		state.Flags &= CF_QUIT;
+		state.Flags &= (CF_QUIT | CF_JOINING | CF_AWAITING_STATE);
 		state.StabilityBuffer = 0u;
 		state.CurrentSequence = min<int>(state.CurrentSequence, tic);
 		state.SequenceAck = min<int>(state.SequenceAck, tic);
@@ -703,7 +742,12 @@ static bool HGetPacket()
 
 	I_NetCmd(CMD_GET);
 	if (RemoteClient == -1)
+	{
+		// Allow NCMD_SETUP packets from unknown clients (mid-game join).
+		if (NetBufferLength > 0 && (NetBuffer[0] & NCMD_SETUP))
+			return true;
 		return false;
+	}
 
 	size_t sizeCheck = GetNetBufferSize();
 	if (NetBufferLength != sizeCheck)
@@ -769,6 +813,19 @@ static void SetArbitrator(int clientNum)
 	Net_SetWaiting();
 }
 
+// Mark a client for disconnect and inject DEM_PLAYERDISCONNECT into the
+// lockstep command stream. All nodes will process the actual game state
+// change (PST_GONE, actor destruction) at the same gametic, preventing
+// desync between the host and remaining clients.
+static void InitiatePlayerDisconnect(int clientNum)
+{
+	if (ClientStates[clientNum].Flags & CF_QUIT)
+		return; // Already pending disconnect.
+	ClientStates[clientNum].Flags |= CF_QUIT;
+	Net_WriteInt8(DEM_PLAYERDISCONNECT);
+	Net_WriteInt8(static_cast<uint8_t>(clientNum));
+}
+
 static void ClientQuit(int clientNum, int newHost)
 {
 	if (!NetworkClients.InGame(clientNum))
@@ -781,14 +838,15 @@ static void ClientQuit(int clientNum, int newHost)
 		if (consoleplayer != Net_Arbitrator)
 			DPrintf(DMSG_WARNING, "Received disconnect packet from client %d erroneously\n", clientNum);
 		else
-			ClientStates[clientNum].Flags |= CF_QUIT;
+			InitiatePlayerDisconnect(clientNum);
 
 		return;
 	}
 
 	DisconnectClient(clientNum);
 	if (clientNum == Net_Arbitrator)
-		SetArbitrator(newHost >= 0 ? newHost : NetworkClients[0]);
+		SetArbitrator((newHost >= 0 && newHost < (int)MAXPLAYERS && NetworkClients.InGame(newHost))
+			? newHost : NetworkClients[0]);
 
 	if (demorecording)
 		G_CheckDemoStatus();
@@ -800,6 +858,8 @@ static void ClientQuit(int clientNum, int newHost)
 
 static void SendSetupPacketToClient(int client, uint8_t subtype, const uint8_t* extra = nullptr, size_t extraSize = 0)
 {
+	if (extraSize > MAX_MSGLEN - 2)
+		return;
 	uint8_t buf[MAX_MSGLEN];
 	buf[0] = NCMD_SETUP;
 	buf[1] = subtype;
@@ -814,6 +874,8 @@ static void SendSetupPacketToClient(int client, uint8_t subtype, const uint8_t* 
 
 static void SendSetupPacketToAll(uint8_t subtype, const uint8_t* extra = nullptr, size_t extraSize = 0, int excludeClient = -1)
 {
+	if (extraSize > MAX_MSGLEN - 2)
+		return;
 	uint8_t buf[MAX_MSGLEN];
 	buf[0] = NCMD_SETUP;
 	buf[1] = subtype;
@@ -852,8 +914,8 @@ void HandleDisconnectRequest()
 
 	DPrintf(DMSG_NOTIFY, "Received disconnect request from client %d\n", clientNum);
 
-	// Mark client for disconnect (same as existing CF_QUIT behavior).
-	ClientStates[clientNum].Flags |= CF_QUIT;
+	// Mark for disconnect and inject DEM so all nodes remove at the same gametic.
+	InitiatePlayerDisconnect(clientNum);
 
 	// Send acknowledgment back to the departing client.
 	SendSetupPacketToClient(clientNum, PRE_DISCONNECT_ACK);
@@ -875,11 +937,15 @@ void HandleDisconnectNotify()
 	if (RemoteClient != Net_Arbitrator)
 		return;
 
+	if (NetBufferLength < 3)
+		return;
+
 	const int nextHost = NetBuffer[2];
 	DPrintf(DMSG_NOTIFY, "Host is leaving, new host is client %d\n", nextHost);
 
 	DisconnectClient(RemoteClient);
-	SetArbitrator(nextHost >= 0 ? nextHost : NetworkClients[0]);
+	SetArbitrator((nextHost >= 0 && nextHost < (int)MAXPLAYERS && NetworkClients.InGame(nextHost))
+		? nextHost : NetworkClients[0]);
 
 	if (demorecording)
 		G_CheckDemoStatus();
@@ -1029,8 +1095,7 @@ void HandleMigrationReady()
 }
 
 // ---------------------------------------------------------------------------
-// Phase 3: Mid-game join handlers (infrastructure only, actual state
-// transfer deferred to issue #22)
+// Phase 3: Mid-game join handlers (dedicated server + state transfer)
 // ---------------------------------------------------------------------------
 
 CUSTOM_CVAR(Bool, net_allowjoin, false, CVAR_SERVERINFO | CVAR_NOSAVE)
@@ -1038,29 +1103,61 @@ CUSTOM_CVAR(Bool, net_allowjoin, false, CVAR_SERVERINFO | CVAR_NOSAVE)
 	// No special handling needed.
 }
 
+// Forward declarations for state transfer and user info (defined later in this file).
+static FStateTransferSend PendingStateTransfer;
+FStateTransferRecv IncomingStateTransfer;
+static void AbortStateTransfer();
+static void BeginStateTransfer(int client);
+void Net_SetupUserInfo();
+static uint32_t StaticSumSeeds();
+
+
 // Host receives: an unknown client wants to join mid-game.
 void HandleMidgameConnect()
 {
 	if (consoleplayer != Net_Arbitrator)
 		return;
 
-	if (!net_allowjoin)
+	// Mid-game join is allowed on dedicated servers by default.
+	// P2P hosts can enable it via net_allowjoin, but it may cause
+	// lockstep desync issues with 3+ players.
+	if (!dedicatedServer && !net_allowjoin)
 	{
 		uint8_t buf[3] = { NCMD_SETUP, PRE_MIDGAME_REJECT, REJECT_DISABLED };
 		I_SendSetupPacketToAddress(buf, 3);
 		return;
 	}
 
-	if (bMigrating)
+	// Reject if another joiner is already in the pipeline — either actively
+	// transferring state or still initializing (V_Init2/shaders) before
+	// requesting state. Without this, multiple clients can be accepted and
+	// all but the first deadlock when their STATE_READY is silently dropped.
+	if (bMigrating || PendingStateTransfer.active)
 	{
 		uint8_t buf[3] = { NCMD_SETUP, PRE_MIDGAME_REJECT, REJECT_IN_TRANSITION };
 		I_SendSetupPacketToAddress(buf, 3);
 		return;
 	}
+	for (auto c : NetworkClients)
+	{
+		if (ClientStates[c].Flags & (CF_JOINING | CF_AWAITING_STATE))
+		{
+			uint8_t buf[3] = { NCMD_SETUP, PRE_MIDGAME_REJECT, REJECT_IN_TRANSITION };
+			I_SendSetupPacketToAddress(buf, 3);
+			return;
+		}
+	}
 
-	// Find a free player slot.
+	if (I_IsAddressBanned())
+	{
+		uint8_t buf[3] = { NCMD_SETUP, PRE_MIDGAME_REJECT, REJECT_BANNED };
+		I_SendSetupPacketToAddress(buf, 3);
+		return;
+	}
+
+	// Find a free player slot (skip slot 0 on dedicated server — ghost player).
 	int freeSlot = -1;
-	for (int i = 0; i < MaxClients; ++i)
+	for (int i = (dedicatedServer ? 1 : 0); i < MaxClients; ++i)
 	{
 		if (!NetworkClients.InGame(i))
 		{
@@ -1076,17 +1173,80 @@ void HandleMidgameConnect()
 		return;
 	}
 
-	// TODO: Validate engine version and password from NetBuffer[2..] here.
-	// For now, accept the connection.
+	// Validate engine version and loaded files.
+	uint8_t* engineInfo = &NetBuffer[2];
+	size_t passwordOffset = 0u;
+	FVerificationError error = Net_VerifyEngine(engineInfo, passwordOffset);
+	if (error.Error != FVerificationError::VE_NONE)
+	{
+		uint8_t buf[3] = { NCMD_SETUP, PRE_MIDGAME_REJECT, REJECT_VERIFICATION };
+		I_SendSetupPacketToAddress(buf, 3);
+		return;
+	}
 
-	// Send acceptance with slot number.
-	uint8_t buf[4] = { NCMD_SETUP, PRE_MIDGAME_ACCEPT, static_cast<uint8_t>(freeSlot), TicDup };
-	I_SendSetupPacketToAddress(buf, 4);
+	// Validate password.
+	const bool hasPassword = strlen(net_password) > 0;
+	if (hasPassword && (2u + passwordOffset >= (size_t)NetBufferLength
+		|| memchr(&NetBuffer[2u + passwordOffset], '\0', NetBufferLength - 2u - passwordOffset) == nullptr
+		|| strcmp(net_password, (const char*)&NetBuffer[2u + passwordOffset])))
+	{
+		uint8_t buf[3] = { NCMD_SETUP, PRE_MIDGAME_REJECT, REJECT_PASSWORD };
+		I_SendSetupPacketToAddress(buf, 3);
+		return;
+	}
 
-	// Register the slot and initialize.
-	NetworkClients += freeSlot;
+	// Send extended acceptance with slot, TicDup, MaxClients, GameID, active roster, LobbyID.
+	uint8_t buf[MAX_MSGLEN];
+	size_t pos = 0;
+	buf[pos++] = NCMD_SETUP;
+	buf[pos++] = PRE_MIDGAME_ACCEPT;
+	buf[pos++] = static_cast<uint8_t>(freeSlot);
+	buf[pos++] = TicDup;
+	buf[pos++] = static_cast<uint8_t>(MaxClients);
+	I_GetGameID(&buf[pos]);
+	pos += 8;
+	buf[pos++] = CurrentLobbyID;
+	buf[pos++] = dedicatedServer ? 1 : 0;
+	// Active player roster: count + list of active client numbers.
+	uint8_t rosterCount = 0;
+	size_t rosterCountPos = pos++;
+	for (auto client : NetworkClients)
+	{
+		if (client != freeSlot)
+		{
+			buf[pos++] = static_cast<uint8_t>(client);
+			rosterCount++;
+		}
+	}
+	buf[rosterCountPos] = rosterCount;
+
+	// Append server CVARs (dmflags, compatflags, etc.) so the joiner
+	// has the same settings as lobby joiners (via PRE_GAME_INFO).
+	// Pre-check size to avoid I_Error if CVARs exceed the remaining buffer.
+	FString cvarDump = C_GetMassCVarString(CVAR_SERVERINFO, true);
+	const size_t cvarNeeded = cvarDump.Len() + 1; // null terminator
+	if (pos + cvarNeeded <= MAX_MSGLEN)
+	{
+		TArrayView<uint8_t> cvarStream = TArrayView(&buf[pos], MAX_MSGLEN - pos);
+		C_WriteCVars(cvarStream, CVAR_SERVERINFO, true);
+		pos += cvarStream.Data() - &buf[pos];
+	}
+	else
+	{
+		Printf("HandleMidgameConnect: CVAR data too large (%zu bytes), sending without\n", cvarNeeded);
+	}
+
+	I_SendSetupPacketToAddress(buf, pos);
+
+	// Initialize network state BEFORE adding to NetworkClients, so the
+	// CF_JOINING flag is set before TryRunTics can see this client.
 	I_SetClientAddress(freeSlot);
 	ClientConnecting(freeSlot);
+	NetworkClients += freeSlot;
+
+	// Don't start state transfer yet — wait until the client is fully
+	// initialized (V_Init2, shaders done) and requests state from D_DoomLoop.
+	// This minimizes the gap between snapshot and DEM_MIDGAMESPAWN.
 }
 
 // Joining client receives: host accepted our mid-game join.
@@ -1095,26 +1255,70 @@ void HandleMidgameAccept()
 	if (consoleplayer != -1)
 		return; // Already have a slot.
 
-	const int slot = NetBuffer[2];
-	const uint8_t ticDup = NetBuffer[3];
+	// Minimum: 2 header + 1 slot + 1 ticdup + 1 maxclients + 8 gameID + 1 lobbyID + 1 dedicated + 1 rosterCount = 16
+	if (NetBufferLength < 16)
+		return;
+
+	size_t pos = 2;
+	const int slot = NetBuffer[pos++];
+	if (slot < 0 || slot >= (int)MAXPLAYERS)
+		return;
+	TicDup = NetBuffer[pos++];
+	MaxClients = NetBuffer[pos++];
+	if (MaxClients <= 0 || MaxClients > (int)MAXPLAYERS)
+		return;
+
+	// GameID (8 bytes)
+	I_SetGameID(&NetBuffer[pos]);
+	pos += 8;
+
+	// LobbyID (1 byte)
+	CurrentLobbyID = NetBuffer[pos++];
+
+	// hostIsDedicated (1 byte)
+	if (NetBuffer[pos++])
+		hostIsDedicated = true;
+
+	// Active player roster
+	const uint8_t rosterCount = NetBuffer[pos++];
+	if (NetBufferLength < pos + rosterCount)
+		return;
+	for (uint8_t i = 0; i < rosterCount; ++i)
+	{
+		const int client = NetBuffer[pos++];
+		if (client >= 0 && client < (int)MAXPLAYERS)
+			NetworkClients += client;
+	}
+
+	// Read server CVARs (dmflags, compatflags, etc.) appended after the roster.
+	if (pos < NetBufferLength)
+	{
+		TArrayView<uint8_t> cvarStream = TArrayView(&NetBuffer[pos], NetBufferLength - pos);
+		C_ReadCVars(cvarStream);
+	}
 
 	consoleplayer = slot;
-	TicDup = ticDup;
 	NetworkClients += slot;
+	Net_SetupUserInfo();
 
-	DPrintf(DMSG_NOTIFY, "Mid-game join accepted, assigned slot %d\n", slot);
-	// Issue #22 will handle receiving and applying game state from here.
+	// Signal that we're joining mid-game. D_InitGame will skip normal map
+	// load, and G_DoMidgameJoin will request state from D_DoomLoop.
+	gameaction = ga_midgamejoin;
+
+	Printf("Mid-game join accepted, assigned slot %d (roster: %d players)\n", slot, rosterCount);
 }
 
 // Joining client receives: host rejected our mid-game join.
 void HandleMidgameReject()
 {
+	if (NetBufferLength < 3)
+		return;
 	const uint8_t reason = NetBuffer[2];
 	const char* reasonStr = "unknown";
 	switch (reason)
 	{
 	case REJECT_FULL:			reasonStr = "game is full"; break;
-	case REJECT_IN_TRANSITION:	reasonStr = "host migration in progress"; break;
+	case REJECT_IN_TRANSITION:	reasonStr = "server is busy (migration or state transfer in progress)"; break;
 	case REJECT_BANNED:			reasonStr = "banned"; break;
 	case REJECT_PASSWORD:		reasonStr = "wrong password"; break;
 	case REJECT_VERIFICATION:	reasonStr = "verification failed"; break;
@@ -1126,12 +1330,32 @@ void HandleMidgameReject()
 // Non-host client receives: a new player is joining.
 void HandleMidgamePlayerJoin()
 {
+	if (NetBufferLength < 3)
+		return;
 	if (RemoteClient != Net_Arbitrator)
 		return;
 
 	const int newPlayer = NetBuffer[2];
-	DPrintf(DMSG_NOTIFY, "Player %d is joining mid-game\n", newPlayer);
+	if (NetworkClients.InGame(newPlayer))
+	{
+		// Already know about this player (retransmitted PLAYER_JOIN). Just ACK again.
+		SendSetupPacketToClient(Net_Arbitrator, PRE_MIDGAME_PLAYER_ACK);
+		return;
+	}
+
+	Printf("Player %d is joining mid-game\n", newPlayer);
 	NetworkClients += newPlayer;
+
+	// Initialize client state for the new player.
+	auto& state = ClientStates[newPlayer];
+	memset(&state, 0, sizeof(FClientNetState));
+	state.CurrentSequence = gametic / TicDup;
+	state.SequenceAck = gametic / TicDup;
+	state.CurrentNetConsistency = CurrentConsistency;
+	state.ConsistencyAck = CurrentConsistency;
+	state.LastVerifiedConsistency = CurrentConsistency;
+	state.Flags = CF_JOINING;
+	state.LastPacketReceivedTime = I_msTime();
 
 	// ACK back to host.
 	SendSetupPacketToClient(Net_Arbitrator, PRE_MIDGAME_PLAYER_ACK);
@@ -1144,6 +1368,490 @@ void HandleMidgamePlayerAck()
 		return;
 
 	DPrintf(DMSG_NOTIFY, "Client %d acknowledged new player\n", RemoteClient);
+}
+
+// ---------------------------------------------------------------------------
+// Mid-game state transfer
+// ---------------------------------------------------------------------------
+
+static void SendNextStateChunk();
+
+static void BeginStateTransfer(int client)
+{
+	auto& xfer = PendingStateTransfer;
+	xfer.Clear();
+
+	xfer.clientNum = client;
+	xfer.hostGametic = gametic;
+	xfer.hostConsistency = CurrentConsistency;
+	xfer.hostLobbyID = CurrentLobbyID;
+	xfer.mapName = primaryLevel->MapName;
+
+	// Undo prediction before snapshot so we capture true state at gametic.
+	if (playeringame[consoleplayer] && !dedicatedServer)
+		P_UnPredictClient();
+
+	// Snapshot the level.
+	primaryLevel->SnapshotLevel();
+	auto* info = FindLevelInfo(primaryLevel->MapName.GetChars());
+	if (!info || !info->Snapshot.mBuffer)
+	{
+		Printf("BeginStateTransfer: failed to create snapshot\n");
+		if (playeringame[consoleplayer] && !dedicatedServer)
+			P_PredictClient();
+		return;
+	}
+
+	// Serialize the full RNG state. The joiner must have the exact same RNG
+	// state as the server at the snapshot gametic so tics between snapshot
+	// and DEM_MIDGAMESPAWN produce identical results on all nodes.
+	TArray<uint8_t> rngData;
+	FRandom::StaticWriteRNGBinary(rngData);
+
+	// Build transfer buffer: [globals (RNG state)] + [16-byte snapshot header] + [compressed snapshot]
+	const auto& snap = info->Snapshot;
+	const size_t snapshotHeaderSize = 16;
+	const size_t snapshotSize = snap.mCompressedSize;
+	xfer.globalsSize = rngData.Size();
+	xfer.data.Resize(xfer.globalsSize + snapshotHeaderSize + snapshotSize);
+
+	// Copy globals (RNG state) first.
+	memcpy(xfer.data.Data(), rngData.Data(), xfer.globalsSize);
+
+	// Then the snapshot header + data.
+	uint8_t* hdr = xfer.data.Data() + xfer.globalsSize;
+	WriteBE32(&hdr[0], snap.mSize);
+	WriteBE32(&hdr[4], snap.mCompressedSize);
+	WriteBE32(&hdr[8], snap.mMethod);
+	WriteBE32(&hdr[12], snap.mCRC32);
+	memcpy(hdr + snapshotHeaderSize, snap.mBuffer, snapshotSize);
+
+	// Clean up the snapshot from the level info (we have our own copy now).
+	info->Snapshot.Clean();
+
+	xfer.numChunks = (xfer.data.Size() + STATE_CHUNK_PAYLOAD - 1) / STATE_CHUNK_PAYLOAD;
+	xfer.nextChunkToSend = 0;
+	xfer.retryCount = 0;
+	xfer.transferStartTime = I_msTime();
+	xfer.active = true;
+
+	// Re-predict after snapshot.
+	if (playeringame[consoleplayer] && !dedicatedServer)
+		P_PredictClient();
+
+	// Send STATE_BEGIN metadata.
+	uint8_t buf[128];
+	size_t pos = 0;
+	buf[pos++] = NCMD_SETUP;
+	buf[pos++] = PRE_MIDGAME_STATE_BEGIN;
+	const size_t totalSize = xfer.data.Size();
+	WriteBE32(&buf[pos], (uint32_t)totalSize);	pos += 4;
+	WriteBE32(&buf[pos], (uint32_t)xfer.globalsSize);	pos += 4;
+	WriteBE32(&buf[pos], (uint32_t)xfer.hostGametic);	pos += 4;
+	WriteBE32(&buf[pos], (uint32_t)xfer.hostConsistency);	pos += 4;
+	// Lobby ID (1 byte)
+	buf[pos++] = xfer.hostLobbyID;
+	// Game skill (1 byte) — must match on all nodes for damage/ammo factors.
+	buf[pos++] = static_cast<uint8_t>(gameskill);
+	// Deathmatch mode (1 byte) — affects item respawns, scoring, etc.
+	buf[pos++] = static_cast<uint8_t>(*deathmatch);
+	// Map name (null-terminated string)
+	const char* mapStr = xfer.mapName.GetChars();
+	const size_t mapLen = strlen(mapStr) + 1;
+	if (pos + mapLen > sizeof(buf))
+	{
+		Printf("BeginStateTransfer: map name too long (%zu)\n", mapLen);
+		AbortStateTransfer();
+		return;
+	}
+	memcpy(&buf[pos], mapStr, mapLen);
+	pos += mapLen;
+
+	I_SendSetupPacket(client, buf, pos);
+
+	// Send first chunk.
+	SendNextStateChunk();
+}
+
+static void AbortStateTransfer()
+{
+	if (PendingStateTransfer.active)
+	{
+		const int client = PendingStateTransfer.clientNum;
+		Printf("State transfer to client %d aborted\n", client);
+
+		// Notify the joiner so they can exit ga_midgamejoin, then clean up
+		// the slot so it doesn't remain in a zombie state.
+		if (NetworkClients.InGame(client))
+		{
+			SendSetupPacketToClient(client, PRE_MIDGAME_STATE_ERROR);
+			ClientStates[client].Flags &= ~(CF_JOINING | CF_AWAITING_STATE);
+			DisconnectClient(client);
+		}
+
+		PendingStateTransfer.Clear();
+	}
+}
+
+static void SendNextStateChunk()
+{
+	auto& xfer = PendingStateTransfer;
+	if (!xfer.active || xfer.nextChunkToSend >= xfer.numChunks)
+		return;
+
+	const size_t offset = xfer.nextChunkToSend * STATE_CHUNK_PAYLOAD;
+	const size_t remaining = xfer.data.Size() - offset;
+	const size_t chunkSize = min<size_t>(remaining, STATE_CHUNK_PAYLOAD);
+
+	uint8_t buf[4 + STATE_CHUNK_PAYLOAD];
+	buf[0] = NCMD_SETUP;
+	buf[1] = PRE_MIDGAME_STATE_CHUNK;
+	WriteBE16(&buf[2], (uint16_t)xfer.nextChunkToSend);
+	memcpy(&buf[4], &xfer.data[offset], chunkSize);
+
+	I_SendSetupPacket(xfer.clientNum, buf, 4 + chunkSize);
+	xfer.lastSendTime = I_msTime();
+}
+
+void TickStateTransfer()
+{
+	auto& xfer = PendingStateTransfer;
+	if (!xfer.active)
+		return;
+
+	// If the target client has been marked for disconnect (CF_QUIT) or is no
+	// longer in the game, abort the transfer immediately.
+	if ((ClientStates[xfer.clientNum].Flags & CF_QUIT) || !NetworkClients.InGame(xfer.clientNum))
+	{
+		Printf("State transfer aborted: client %d disconnected\n", xfer.clientNum);
+		AbortStateTransfer();
+		return;
+	}
+
+	const uint64_t now = I_msTime();
+
+	// Hard timeout: if the entire transfer (including client load time) exceeds
+	// the total timeout, abort. This catches clients that crash during load.
+	if (now - xfer.transferStartTime >= STATE_TRANSFER_TOTAL_TIMEOUT_MS)
+	{
+		Printf("State transfer to client %d timed out (total elapsed %llums)\n",
+			   xfer.clientNum, (unsigned long long)(now - xfer.transferStartTime));
+		AbortStateTransfer();
+		return;
+	}
+
+	if (now - xfer.lastSendTime >= (uint64_t)STATE_TRANSFER_TIMEOUT_MS)
+	{
+		if (xfer.retryCount >= STATE_TRANSFER_MAX_RETRIES)
+		{
+			Printf("State transfer to client %d timed out (chunk retries exhausted)\n", xfer.clientNum);
+			AbortStateTransfer();
+			return;
+		}
+
+		if (xfer.nextChunkToSend < xfer.numChunks)
+		{
+			// Resend current chunk.
+			SendNextStateChunk();
+			xfer.retryCount++;
+		}
+		else
+		{
+			// All chunks sent, waiting for client to load snapshot.
+			// Client may take a long time (shader compilation, etc.)
+			// so just periodically resend STATE_COMPLETE. The hard timeout
+			// above ensures we don't wait forever if the client crashed.
+			uint8_t buf[2] = { NCMD_SETUP, PRE_MIDGAME_STATE_COMPLETE };
+			I_SendSetupPacket(xfer.clientNum, buf, 2);
+			xfer.lastSendTime = now;
+		}
+	}
+}
+
+// Host receives: chunk ACK from joining client.
+void HandleMidgameStateChunkAck()
+{
+	if (NetBufferLength < 4)
+		return;
+	if (consoleplayer != Net_Arbitrator || !PendingStateTransfer.active)
+		return;
+	if (RemoteClient != PendingStateTransfer.clientNum)
+		return;
+
+	const size_t ackChunk = ReadBE16(&NetBuffer[2]);
+	auto& xfer = PendingStateTransfer;
+
+	if ((int)ackChunk != (int)xfer.nextChunkToSend)
+		return; // Out of order ACK, ignore.
+
+	xfer.nextChunkToSend++;
+	xfer.retryCount = 0;
+
+	if (xfer.nextChunkToSend >= xfer.numChunks)
+	{
+		// All chunks sent and ACKed. Send completion signal.
+		uint8_t buf[2] = { NCMD_SETUP, PRE_MIDGAME_STATE_COMPLETE };
+		I_SendSetupPacket(xfer.clientNum, buf, 2);
+		// Reset timer — now waiting for STATE_LOADED from the client.
+		xfer.lastSendTime = I_msTime();
+		xfer.retryCount = 0;
+	}
+	else
+	{
+		// Send next chunk.
+		SendNextStateChunk();
+	}
+}
+
+// Joiner receives: state transfer metadata from host.
+void HandleMidgameStateBegin()
+{
+	auto& xfer = IncomingStateTransfer;
+	if (xfer.active)
+		return; // Already receiving.
+
+	// Minimum size: 2 (header) + 4+4+4+4+1+1+1 (fields) + 1 (map name null) = 22 bytes.
+	if (NetBufferLength < 22)
+		return;
+
+	uint8_t* p = &NetBuffer[2];
+	xfer.totalSize = ReadBE32(p);	p += 4;
+	xfer.globalsSize = ReadBE32(p);	p += 4;
+	xfer.hostGametic = (int)ReadBE32(p);	p += 4;
+	xfer.hostConsistency = (int)ReadBE32(p);	p += 4;
+	xfer.hostLobbyID = p[0];
+	p += 1;
+	// Synchronize game skill and deathmatch mode from the host.
+	// These CVAR_LATCH CVARs are NOT included in the snapshot — they're
+	// applied by G_InitNew via UnlatchCVars(). Without this, joiners use
+	// their own defaults, causing damage/ammo factor divergence.
+	gameskill = (int)p[0];
+	p += 1;
+	deathmatch = (int)p[0];
+	p += 1;
+
+	// Validate that globalsSize fits within totalSize.
+	if (xfer.globalsSize > xfer.totalSize)
+		return;
+
+	// Validate that mapName is null-terminated within the remaining buffer.
+	const size_t remaining = NetBufferLength - (p - &NetBuffer[0]);
+	if (memchr(p, '\0', remaining) == nullptr)
+		return;
+	xfer.mapName = (const char*)p;
+
+	// Sanity-check totalSize to prevent malicious packets from causing
+	// excessive memory allocation. 64MB is far beyond any real snapshot.
+	constexpr size_t MAX_STATE_SIZE = 64u * 1024u * 1024u;
+	if (xfer.totalSize == 0 || xfer.totalSize > MAX_STATE_SIZE)
+		return;
+
+	xfer.numChunks = (xfer.totalSize + STATE_CHUNK_PAYLOAD - 1) / STATE_CHUNK_PAYLOAD;
+	xfer.data.Resize(xfer.totalSize);
+	memset(xfer.data.Data(), 0, xfer.totalSize);
+	xfer.nextExpectedChunk = 0;
+	xfer.active = true;
+}
+
+// Joiner receives: one chunk of state data.
+void HandleMidgameStateChunk()
+{
+	if (NetBufferLength < 5)
+		return; // Minimum: 2 header + 2 chunk index + 1 byte data
+
+	auto& xfer = IncomingStateTransfer;
+	if (!xfer.active)
+		return;
+
+	const size_t chunkIdx = ReadBE16(&NetBuffer[2]);
+	if (chunkIdx != xfer.nextExpectedChunk)
+		return; // Out of order, ignore (host will retransmit).
+
+	const size_t offset = chunkIdx * STATE_CHUNK_PAYLOAD;
+	const size_t chunkSize = NetBufferLength - 4;
+	if (offset + chunkSize > xfer.totalSize)
+	{
+		Printf("State transfer error: chunk overflows buffer\n");
+		xfer.Clear();
+		return;
+	}
+
+	memcpy(&xfer.data[offset], &NetBuffer[4], chunkSize);
+	xfer.nextExpectedChunk++;
+
+	// ACK this chunk.
+	uint8_t buf[4] = { NCMD_SETUP, PRE_MIDGAME_STATE_CHUNK_ACK, NetBuffer[2], NetBuffer[3] };
+	I_SendSetupPacket(Net_Arbitrator, buf, 4);
+}
+
+// Joiner receives: all chunks have been sent.
+void HandleMidgameStateComplete()
+{
+	auto& xfer = IncomingStateTransfer;
+	if (!xfer.active)
+	{
+		// We already loaded the snapshot and sent STATE_LOADED, but the host
+		// didn't receive it (packet loss). Resend so the host can proceed.
+		if (xfer.loadedSent)
+		{
+			uint8_t buf[2] = { NCMD_SETUP, PRE_MIDGAME_STATE_LOADED };
+			I_SendSetupPacket(Net_Arbitrator, buf, 2);
+		}
+		return;
+	}
+
+	if (xfer.nextExpectedChunk < xfer.numChunks)
+	{
+		// Missing chunks — send error.
+		uint8_t buf[2] = { NCMD_SETUP, PRE_MIDGAME_STATE_ERROR };
+		I_SendSetupPacket(Net_Arbitrator, buf, 2);
+		Printf("State transfer incomplete: expected %zu chunks, got %zu\n",
+			   xfer.numChunks, xfer.nextExpectedChunk);
+		xfer.Clear();
+		gameaction = ga_fullconsole;
+		return;
+	}
+
+	Printf("Game state received, loading...\n");
+	xfer.active = false; // Prevent retransmitted STATE_COMPLETE from re-triggering
+	// gameaction is already ga_midgamejoin (set in HandleMidgameAccept).
+	// G_DoMidgameJoin will detect xfer.data.Size() > 0 and load the snapshot.
+}
+
+// Host receives: STATE_READY from joiner. Client is initialized (V_Init2 done)
+// and ready to receive state. Take a fresh snapshot and start transfer.
+void HandleMidgameStateReady()
+{
+	if (consoleplayer != Net_Arbitrator)
+		return;
+
+	const int joinerSlot = RemoteClient;
+	if (joinerSlot < 0
+		|| !(ClientStates[joinerSlot].Flags & CF_JOINING)
+		|| !(ClientStates[joinerSlot].Flags & CF_AWAITING_STATE))
+		return;
+
+	if (PendingStateTransfer.active)
+		return; // Already transferring state to someone.
+
+	Printf("Client %d ready for state, taking snapshot...\n", joinerSlot);
+	BeginStateTransfer(joinerSlot);
+}
+
+// Host receives: STATE_LOADED from joiner. Client loaded the snapshot
+// successfully. Broadcast PLAYER_JOIN and inject DEM_MIDGAMESPAWN.
+void HandleMidgameStateLoaded()
+{
+	if (consoleplayer != Net_Arbitrator)
+		return;
+
+	const int joinerSlot = RemoteClient;
+	if (joinerSlot < 0
+		|| !(ClientStates[joinerSlot].Flags & CF_JOINING)
+		|| !(ClientStates[joinerSlot].Flags & CF_AWAITING_STATE))
+		return;
+
+	// Verify this is the client we're actually transferring state to.
+	if (!PendingStateTransfer.active || joinerSlot != PendingStateTransfer.clientNum)
+		return;
+
+	Printf("Client %d loaded game state, spawning player\n", joinerSlot);
+
+	// Notify all existing clients that a new player is joining.
+	uint8_t buf[3];
+	buf[0] = NCMD_SETUP;
+	buf[1] = PRE_MIDGAME_PLAYER_JOIN;
+	buf[2] = static_cast<uint8_t>(joinerSlot);
+	for (auto c : NetworkClients)
+	{
+		if (c != consoleplayer && c != joinerSlot)
+			I_SendSetupPacket(c, buf, 3);
+	}
+
+	// Inject DEM_MIDGAMESPAWN into the host's event stream.
+	// All nodes (host + existing clients + joiner) will process this at the
+	// same gametic via the lockstep protocol, deterministically spawning the
+	// new player's actor.
+	Net_WriteInt8(DEM_MIDGAMESPAWN);
+	Net_WriteInt8(static_cast<uint8_t>(joinerSlot));
+
+	// Proactively send commands from the snapshot gametic to the joiner.
+	// The host's send loop normally starts from gametic/TicDup (current tic),
+	// but the joiner's snapshot was taken at hostGametic — creating a gap
+	// where the joiner needs commands that would never be sent. Without this,
+	// the joiner stalls for seconds while the retransmission mechanism slowly
+	// fills the gap one round-trip at a time.
+	ClientStates[joinerSlot].ResendSequenceFrom = PendingStateTransfer.hostGametic / TicDup;
+
+	// Clear CF_AWAITING_STATE so duplicate STATE_LOADED packets won't
+	// re-trigger before DEM_MIDGAMESPAWN clears CF_JOINING.
+	ClientStates[joinerSlot].Flags &= ~CF_AWAITING_STATE;
+
+	PendingStateTransfer.Clear();
+}
+
+// Host/Joiner receives: error during state transfer.
+void HandleMidgameStateError()
+{
+	if (consoleplayer == Net_Arbitrator)
+	{
+		Printf("Client reported state transfer error, aborting\n");
+		AbortStateTransfer();
+	}
+	else
+	{
+		Printf("Host reported state transfer error\n");
+		G_AbortMidgameJoin();
+	}
+}
+
+// Called from G_DoMidgameJoin after snapshot is loaded. Aligns the joiner's
+// network state with the host's so lockstep proceeds correctly.
+void Net_PrepareMidgameSync()
+{
+	auto& xfer = IncomingStateTransfer;
+
+	gametic = xfer.hostGametic;
+	ClientTic = xfer.hostGametic / TicDup;
+	CurrentConsistency = xfer.hostConsistency;
+	LastSentConsistency = xfer.hostConsistency;
+	CurrentLobbyID = xfer.hostLobbyID;
+
+	// RNG state is restored from the globals portion in G_DoMidgameJoin(),
+	// which runs before this function. The joiner now has the exact same
+	// RNG state as the server at the snapshot gametic.
+
+	// Clear local commands so we don't replay stale input.
+	memset(LocalCmds, 0, sizeof(LocalCmds));
+
+	// Initialize our own client state.
+	auto& state = ClientStates[consoleplayer];
+	memset(&state, 0, sizeof(FClientNetState));
+	state.CurrentSequence = ClientTic;
+	state.SequenceAck = ClientTic;
+	state.CurrentNetConsistency = CurrentConsistency;
+	state.ConsistencyAck = CurrentConsistency;
+	state.LastVerifiedConsistency = CurrentConsistency;
+	state.LastPacketReceivedTime = I_msTime();
+
+	// Initialize sequence and consistency tracking for all existing clients.
+	// Without this, stale CurrentSequence values from the pre-game lobby
+	// (e.g., seq 699) would make lowestSequence negative, freezing the
+	// joiner — which then starves the host of commands, freezing everyone.
+	for (auto c : NetworkClients)
+	{
+		if (c != consoleplayer)
+		{
+			ClientStates[c].CurrentSequence = ClientTic;
+			ClientStates[c].SequenceAck = ClientTic;
+			ClientStates[c].LastVerifiedConsistency = CurrentConsistency;
+			ClientStates[c].CurrentNetConsistency = CurrentConsistency;
+			ClientStates[c].ConsistencyAck = CurrentConsistency;
+		}
+	}
+
+	Printf("Mid-game sync: gametic=%d, consistency=%d, lobbyID=%d\n",
+		   gametic, CurrentConsistency, CurrentLobbyID);
 }
 
 // ---------------------------------------------------------------------------
@@ -1242,7 +1950,16 @@ static void GetPackets()
 	TArray<FLatencyAck> latencyAcks = {};
 	while (HGetPacket())
 	{
-		const int clientNum =  RemoteClient;
+		const int clientNum = RemoteClient;
+
+		// Unknown client with NCMD_SETUP — handle mid-game join then skip.
+		if (clientNum < 0)
+		{
+			if (NetBuffer[0] & NCMD_SETUP)
+				HandleIncomingConnection();
+			continue;
+		}
+
 		auto& clientState = ClientStates[clientNum];
 
 		// Track last valid packet time for heartbeat timeout detection.
@@ -1320,7 +2037,22 @@ static void GetPackets()
 		{
 			int numPlayers = NetBuffer[curByte++];
 			for (int i = 0; i < numPlayers; ++i)
-				DisconnectClient(NetBuffer[curByte++]);
+			{
+				int quitNum = NetBuffer[curByte++];
+				if (quitNum >= (int)MAXPLAYERS)
+					continue;
+				// Network bookkeeping only — remove from the client list and
+				// clear tracking masks so the lockstep doesn't stall. The
+				// actual game state change (PST_GONE, actor destruction) is
+				// deferred to DEM_PLAYERDISCONNECT so it happens at the same
+				// gametic on all nodes, preventing desync.
+				NetworkClients -= quitNum;
+				const uint64_t mask = ~((uint64_t)1u << quitNum);
+				MutedClients &= mask;
+				CutsceneReady &= mask;
+				LevelStartAck &= mask;
+				I_ClearClient(quitNum);
+			}
 		}
 
 		const int playerCount = NetBuffer[curByte++];
@@ -1494,6 +2226,9 @@ static void CheckConsistencies()
 	// if the client's current position doesn't agree with the host.
 	for (auto client : NetworkClients)
 	{
+		if (!playeringame[client])
+			continue;
+
 		auto& clientState = ClientStates[client];
 		// If previously inconsistent, always mark it as such going forward. We don't want this to
 		// accidentally go away at some point since the game state is already completely broken.
@@ -1503,6 +2238,11 @@ static void CheckConsistencies()
 		}
 		else
 		{
+			// Don't check tics whose LocalConsistency buffer slot has been
+			// overwritten by a newer tic (circular buffer wraparound).
+			if (CurrentConsistency - clientState.LastVerifiedConsistency >= BACKUPTICS)
+				clientState.LastVerifiedConsistency = CurrentConsistency - BACKUPTICS;
+
 			// Make sure we don't check past tics we haven't even ran yet.
 			const int limit = min<int>(CurrentConsistency - 1, clientState.CurrentNetConsistency);
 			while (clientState.LastVerifiedConsistency < limit)
@@ -1537,11 +2277,7 @@ extern FRandom pr_damagemobj;
 
 static uint32_t StaticSumSeeds()
 {
-	return
-		pr_spawnmobj.Seed() +
-		pr_acs.Seed() +
-		pr_chase.Seed() +
-		pr_damagemobj.Seed();
+	return FRandom::StaticSumAllSeeds();
 }
 
 static int16_t CalculateConsistency(int client, uint32_t seed)
@@ -1556,6 +2292,7 @@ static int16_t CalculateConsistency(int client, uint32_t seed)
 	return (seed & 0xFFFF) ? seed : 1;
 }
 
+
 // Ran a tick, so prep the next consistencies to send out.
 // [RH] Include some random seeds and player stuff in the consistancy
 // check, not just the player's x position like BOOM.
@@ -1565,8 +2302,15 @@ static void MakeConsistencies()
 		return;
 
 	const uint32_t rngSum = StaticSumSeeds();
+
 	for (auto client : NetworkClients)
 	{
+		if (!playeringame[client])
+			continue;
+		// Skip the ghost player on dedicated servers — it has no real input
+		// and its state is irrelevant to gameplay consistency.
+		if ((dedicatedServer || hostIsDedicated) && client == 0)
+			continue;
 		auto& clientState = ClientStates[client];
 		clientState.LocalConsistency[CurrentConsistency % BACKUPTICS] = CalculateConsistency(client, rngSum);
 	}
@@ -1701,6 +2445,13 @@ static bool Net_UpdateStatus()
 void NetUpdate(int tics)
 {
 	GetPackets();
+
+	// State transfer processing runs regardless of tics — the joining client
+	// may be lockstep-blocked (tics=0) while receiving chunks, and the host
+	// needs to retransmit/timeout even between tics.
+	if (netgame && !demoplayback)
+		TickStateTransfer();
+
 	if (tics <= 0)
 		return;
 
@@ -1733,10 +2484,29 @@ void NetUpdate(int tics)
 					continue;
 
 				auto& state = ClientStates[client];
+				// Don't timeout joining clients via heartbeat — they send setup
+				// packets (chunk ACKs) that don't update LastPacketReceivedTime.
+				// TickStateTransfer() handles timeout for active transfers instead.
+				if (state.Flags & (CF_JOINING | CF_AWAITING_STATE))
+				{
+					// Timeout joining clients if they've been waiting too long
+					// without transfer starting (e.g., STATE_READY lost).
+					// Active transfers are timed out by TickStateTransfer() instead.
+					if ((state.Flags & CF_AWAITING_STATE)
+						&& !PendingStateTransfer.active
+						&& state.LastPacketReceivedTime > 0
+						&& (now - state.LastPacketReceivedTime) >= STATE_TRANSFER_TOTAL_TIMEOUT_MS)
+					{
+						Printf("Joining client %d timed out (state transfer never started)\n", client);
+						ClientStates[client].Flags &= ~(CF_JOINING | CF_AWAITING_STATE);
+						DisconnectClient(client);
+					}
+					continue;
+				}
 				if (state.LastPacketReceivedTime > 0 && (now - state.LastPacketReceivedTime) >= CLIENT_TIMEOUT_MS)
 				{
 					Printf("Client %d timed out (no packets for %llums)\n", client, (unsigned long long)(now - state.LastPacketReceivedTime));
-					state.Flags |= CF_QUIT;
+					InitiatePlayerDisconnect(client);
 					state.LastPacketReceivedTime = 0; // Prevent repeated timeout messages.
 				}
 			}
@@ -1804,8 +2574,11 @@ void NetUpdate(int tics)
 
 	for (int i = 0; i < tics; ++i)
 	{
-		I_StartTic();
-		D_ProcessEvents();
+		if (!dedicatedServer)
+		{
+			I_StartTic();
+			D_ProcessEvents();
+		}
 		if (pauseext || !netGood)
 			break;
 
@@ -1814,8 +2587,16 @@ void NetUpdate(int tics)
 			--SkipCommandAmount;
 			continue;
 		}
-		
-		G_BuildTiccmd(&LocalCmds[ClientTic++ % LOCALCMDTICS]);
+
+		if (dedicatedServer)
+		{
+			// Dedicated server generates empty commands — no input, no actor.
+			memset(&LocalCmds[ClientTic++ % LOCALCMDTICS], 0, sizeof(usercmd_t));
+		}
+		else
+		{
+			G_BuildTiccmd(&LocalCmds[ClientTic++ % LOCALCMDTICS]);
+		}
 		if (TicDup == 1)
 		{
 			Net_NewClientTic();
@@ -1916,6 +2697,10 @@ void NetUpdate(int tics)
 			{
 				quitNums[quitters++] = client;
 			}
+			else if (ClientStates[client].Flags & (CF_JOINING | CF_AWAITING_STATE))
+			{
+				// Skip joining clients — they don't participate in lockstep yet.
+			}
 			else
 			{
 				++players;
@@ -2010,9 +2795,13 @@ void NetUpdate(int tics)
 
 		const int baseConsistency = curState.ResendConsistencyFrom >= 0 ? curState.ResendConsistencyFrom : LastSentConsistency;
 		// Don't bother sending over consistencies unless you're the host.
+		// Cap to BACKUPTICS so we never read overwritten circular buffer
+		// slots. The old MAXSENDTICS cap caused LastSentConsistency to jump
+		// past unsent values, creating permanent gaps that led to false
+		// desyncs on both the host (loopback) and remote clients.
 		int ran = 0;
 		if (consoleplayer == Net_Arbitrator)
-			ran = clamp<int>(CurrentConsistency - baseConsistency, 0, MAXSENDTICS);
+			ran = clamp<int>(CurrentConsistency - baseConsistency, 0, BACKUPTICS);
 
 		int ticLoops = static_cast<int>(ceil(max<double>(numTics, ran) / maxCommands));
 		if (isSelf || !ticLoops)
@@ -2047,7 +2836,7 @@ void NetUpdate(int tics)
 					int i = 0;
 					for (auto cl : NetworkClients)
 					{
-						if (ClientStates[cl].Flags & CF_QUIT)
+						if (ClientStates[cl].Flags & (CF_QUIT | CF_JOINING | CF_AWAITING_STATE))
 							continue;
 
 						if (i >= curPlayerOfs)
@@ -2327,6 +3116,9 @@ void Net_SetGameInfo(TArrayView<uint8_t>& stream)
 	{
 		WriteInt8(0, stream);
 	}
+
+	// Tell clients whether the host is a dedicated server (ghost player 0).
+	WriteInt8(dedicatedServer ? 1 : 0, stream);
 }
 
 
@@ -2348,6 +3140,10 @@ void Net_ReadGameInfo(TArrayView<uint8_t>& stream)
 		}
 	}
 
+	// Check if the host is a dedicated server — if so, slot 0 is not a real player.
+	if (ReadInt8(stream))
+		hostIsDedicated = true;
+
 	// Reset this immediately so any further RNG calls the engine has to make will be synced.
 	FRandom::StaticClearRandom();
 }
@@ -2365,13 +3161,20 @@ bool D_CheckNetGame()
 	const uint64_t startTime = I_msTime();
 	for (auto client : NetworkClients)
 	{
+		// Mid-game joiner: skip our own slot — we enter via DEM_MIDGAMESPAWN later.
+		if (gameaction == ga_midgamejoin && client == consoleplayer)
+			continue;
+
 		playeringame[client] = true;
 		ClientStates[client].LastPacketReceivedTime = startTime;
 	}
 
 	if (MaxClients > 1u)
 	{
-		Printf("Player %d of %d\n", consoleplayer + 1, MaxClients);
+		if (dedicatedServer)
+			Printf("Dedicated server hosting %d players\n", MaxClients);
+		else
+			Printf("Player %d of %d\n", consoleplayer + 1, MaxClients);
 	}
 
 	return true;
@@ -2390,6 +3193,53 @@ void D_QuitNetGame()
 	bDisconnecting = true;
 	DisconnectTimestamp = I_msTime();
 	DisconnectRetries = 0;
+
+	if (dedicatedServer)
+	{
+		// Dedicated server: no migration, just tell everyone the server is shutting down.
+		Printf("Dedicated server shutting down, disconnecting all clients\n");
+
+		// Send disconnect notification (no next host — 0xFF means server is gone).
+		uint8_t noNextHost = 0xFF;
+		SendSetupPacketToAll(PRE_DISCONNECT_NOTIFY, &noNextHost, 1);
+
+		// Wait briefly for confirmations.
+		uint64_t expectedMask = 0;
+		for (auto client : NetworkClients)
+		{
+			if (client != consoleplayer)
+				expectedMask |= ((uint64_t)1u << client);
+		}
+
+		DisconnectConfirmMask = 0;
+		DisconnectTimestamp = I_msTime();
+		DisconnectRetries = 0;
+		while ((DisconnectConfirmMask & expectedMask) != expectedMask && DisconnectRetries < DISCONNECT_MAX_RETRIES)
+		{
+			while (HGetPacket())
+			{
+				if (NetBuffer[0] & NCMD_SETUP)
+					HandleIncomingConnection();
+			}
+
+			const uint64_t now = I_msTime();
+			if (now - DisconnectTimestamp >= (uint64_t)DISCONNECT_TIMEOUT_MS)
+			{
+				for (auto client : NetworkClients)
+				{
+					if (client != consoleplayer && !(DisconnectConfirmMask & ((uint64_t)1u << client)))
+						SendSetupPacketToClient(client, PRE_DISCONNECT_NOTIFY, &noNextHost, 1);
+				}
+				DisconnectTimestamp = now;
+				DisconnectRetries++;
+			}
+
+			I_WaitVBL(1);
+		}
+
+		bDisconnecting = false;
+		return;
+	}
 
 	if (consoleplayer == Net_Arbitrator)
 	{
@@ -2717,6 +3567,8 @@ void TryRunTics()
 		doWait = false;
 	if (!netgame && !AppActive && vid_lowerinbackground)
 		doWait = true;
+	if (dedicatedServer)
+		doWait = true;
 
 	// Get the full number of tics the client can run.
 	if (doWait)
@@ -2735,6 +3587,22 @@ void TryRunTics()
 	// generated in advanced from the last time the game updated.
 	NetUpdate(totalTics);
 
+	// Mid-game join: process state transfer outside the lockstep. The joining
+	// client is blocked at tics=0 because it has no commands from the host yet.
+	// G_DoMidgameJoin only does I/O (request state, receive chunks, load snapshot)
+	// — the actual player spawn goes through DEM_MIDGAMESPAWN via the lockstep.
+	if (gameaction == ga_midgamejoin)
+	{
+		G_DoMidgameJoin();
+		// Keep LastEnterTic current so that when ga_midgamejoin clears,
+		// the next TryRunTics doesn't see a huge totalTics burst.
+		// Without this, NetUpdate generates hundreds of commands at once
+		// but MAXSENDTICS only sends 35 — the rest are never sent,
+		// creating a gap that freezes the host after exactly 35 tics.
+		LastEnterTic = EnterTic;
+		return;
+	}
+
 	LastEnterTic = EnterTic;
 
 	// If the game is paused, everything we need to update has already done so.
@@ -2746,8 +3614,21 @@ void TryRunTics()
 	int lowestSequence = INT_MAX;
 	for (auto client : NetworkClients)
 	{
-		if (ClientStates[client].CurrentSequence < lowestSequence)
-			lowestSequence = ClientStates[client].CurrentSequence;
+		// Skip joining clients — they have no commands yet and would block the lockstep.
+		// Skip quitting clients — they stopped sending commands and will be removed by
+		// NCMD_QUITTERS (network) + DEM_PLAYERDISCONNECT (game state) shortly.
+		if (ClientStates[client].Flags & (CF_JOINING | CF_AWAITING_STATE | CF_QUIT))
+			continue;
+		int seq = ClientStates[client].CurrentSequence;
+		// Non-host clients have their own commands in the local buffer already.
+		// Use the local command count instead of waiting for the host echo, which
+		// requires a round-trip per tic. Without this, a mid-game joiner (whose
+		// command buffer starts at zero depth) freezes while its own
+		// CurrentSequence trickles up one round-trip at a time.
+		if (consoleplayer != Net_Arbitrator && client == consoleplayer)
+			seq = max(seq, ClientTic / TicDup - 1);
+		if (seq < lowestSequence)
+			lowestSequence = seq;
 	}
 
 	// Test player prediction code in singleplayer by pretending there is another player
@@ -2791,13 +3672,14 @@ void TryRunTics()
 		}
 		else
 		{
-			P_ClearLevelInterpolation();
+			if (!dedicatedServer)
+				P_ClearLevelInterpolation();
 			LagState = LAG_WAITING;
 		}
 
 		// If we actually advanced a command, update the player's position (even if a
 		// tic passes this isn't guaranteed to happen since it's capped to 35 in advance).
-		if (ClientTic > startCommand)
+		if (ClientTic > startCommand && playeringame[consoleplayer] && !cl_noprediction && !dedicatedServer)
 		{
 			LagState = LAG_PREDICTING;
 			P_PredictClient();
@@ -2805,13 +3687,18 @@ void TryRunTics()
 
 		// If we actually did have some tics available, make sure the UI
 		// still has a chance to run.
-		for (int i = 0; i < totalTics; ++i)
-			P_RunClientSideLogic();
+		if (!dedicatedServer)
+		{
+			for (int i = 0; i < totalTics; ++i)
+				P_RunClientSideLogic();
+		}
 
 		if (totalTics > 0)
 		{
-			S_UpdateSounds(players[consoleplayer].camera, primaryLevel->LocalWorldTimer - min<int>(primaryLevel->LocalWorldTimer, worldTimer));
-			NetworkEntityManager::VerifyPredictedEntities();
+			if (!dedicatedServer && playeringame[consoleplayer])
+				S_UpdateSounds(players[consoleplayer].camera, primaryLevel->LocalWorldTimer - min<int>(primaryLevel->LocalWorldTimer, worldTimer));
+			if (!dedicatedServer)
+				NetworkEntityManager::VerifyPredictedEntities();
 		}
 
 		return;
@@ -2825,10 +3712,12 @@ void TryRunTics()
 	LastGameUpdate = EnterTic;
 
 	// Run the available tics.
-	P_UnPredictClient();
+	if (playeringame[consoleplayer] && !cl_noprediction && !dedicatedServer)
+		P_UnPredictClient();
+
 	while (runTics--)
 	{
-		const bool stabilize = ShouldStabilizeTick();
+		const bool stabilize = !dedicatedServer && ShouldStabilizeTick();
 		if (stabilize)
 			TicStabilityBegin();
 
@@ -2848,17 +3737,23 @@ void TryRunTics()
 			break;
 		}
 	}
-	P_PredictClient();
+	if (playeringame[consoleplayer] && !cl_noprediction && !dedicatedServer)
+		P_PredictClient();
 
 	// These should use the actual tics since they're not actually tied to the gameplay logic.
 	// Make sure it always comes after so the HUD has the correct game state when updating.
-	for (int i = 0; i < totalTics; ++i)
-		P_RunClientSideLogic();
+	if (!dedicatedServer)
+	{
+		for (int i = 0; i < totalTics; ++i)
+			P_RunClientSideLogic();
+	}
 
 	// Since the level could get reset mid-tick, make sure the smaller of the two values is used
 	// since it should only go up otherwise.
-	S_UpdateSounds(players[consoleplayer].camera, primaryLevel->LocalWorldTimer - min<int>(primaryLevel->LocalWorldTimer, worldTimer));
-	NetworkEntityManager::VerifyPredictedEntities();
+	if (!dedicatedServer && playeringame[consoleplayer])
+		S_UpdateSounds(players[consoleplayer].camera, primaryLevel->LocalWorldTimer - min<int>(primaryLevel->LocalWorldTimer, worldTimer));
+	if (!dedicatedServer)
+		NetworkEntityManager::VerifyPredictedEntities();
 }
 
 void Net_NewClientTic()
@@ -3683,7 +4578,75 @@ void Net_DoCommand(int cmd, TArrayView<uint8_t>& stream, int player)
 	case DEM_USEFLECHETTE:
 		UseFlechette(player);
 		break;
-		
+
+	case DEM_MIDGAMESPAWN:
+	{
+		const int pnum = ReadInt8(stream);
+		if (pnum >= 0 && pnum < (int)MAXPLAYERS && !playeringame[pnum])
+		{
+			playeringame[pnum] = true;
+			players[pnum].playerstate = PST_ENTER;
+			// Clear the joining flags now that they're officially in the game.
+			ClientStates[pnum].Flags &= ~(CF_JOINING | CF_AWAITING_STATE);
+			// Synchronize the joiner's command sequence to the current gametic
+			// on ALL nodes. ClientConnecting set CurrentSequence at CONNECT time
+			// (before V_Init2/state transfer), so it's now stale by hundreds of
+			// tics. Without this update, the stale sequence blocks lowestSequence
+			// in TryRunTics, freezing the entire lockstep until the joiner's
+			// actual commands catch up — causing a multi-second freeze for all
+			// clients and subsequent input lag from command pileup.
+			ClientStates[pnum].CurrentSequence = gametic / TicDup;
+			ClientStates[pnum].SequenceAck = gametic / TicDup;
+			// Initialize consistency tracking for the new player on all nodes,
+			// and for all existing players on the joiner's node. Without this,
+			// stale circular buffer entries would cause false desyncs.
+			ClientStates[pnum].LastVerifiedConsistency = CurrentConsistency;
+			ClientStates[pnum].CurrentNetConsistency = CurrentConsistency;
+			ClientStates[pnum].ConsistencyAck = CurrentConsistency;
+			if (pnum == consoleplayer)
+			{
+				// This is the joiner processing its own spawn. Initialize
+				// consistency tracking for all existing clients too.
+				for (auto c : NetworkClients)
+				{
+					if (c != pnum)
+					{
+						ClientStates[c].LastVerifiedConsistency = CurrentConsistency;
+						ClientStates[c].CurrentNetConsistency = CurrentConsistency;
+						ClientStates[c].ConsistencyAck = CurrentConsistency;
+					}
+				}
+			}
+			// Immediately spawn the player via DoReborn to avoid P_PlayerThink
+			// seeing a null mo before the next G_Ticker spawn loop runs.
+			primaryLevel->DoReborn(pnum, true);
+			// On the joiner's node, clear stale prediction data so the first
+			// P_PredictClient call starts fresh with the newly spawned actor.
+			if (pnum == consoleplayer)
+			{
+				P_ClearPredictionData();
+				IncomingStateTransfer.loadedSent = false;
+			}
+			// RNG state is synchronized via full serialization in the state
+			// transfer (globals portion). No seed-based reset needed.
+			Printf("Player %d has joined the game\n", pnum + 1);
+		}
+		break;
+	}
+
+	case DEM_PLAYERDISCONNECT:
+	{
+		const int pnum = ReadInt8(stream);
+		if (pnum >= 0 && pnum < (int)MAXPLAYERS && playeringame[pnum])
+		{
+			// Set PST_GONE so G_DoPlayerPop runs at the start of the next
+			// G_Ticker. All nodes process this at the same gametic,
+			// ensuring deterministic removal of the player's actor.
+			players[pnum].playerstate = PST_GONE;
+		}
+		break;
+	}
+
 	default:
 		I_Error("Unknown net command: %d", cmd);
 		break;
@@ -3789,6 +4752,8 @@ void Net_SkipCommand(int cmd, TArrayView<uint8_t>& stream)
 		case DEM_DELCONTROLLER:
 		case DEM_KICK:
 		case DEM_WEAPSELECT:
+		case DEM_MIDGAMESPAWN:
+		case DEM_PLAYERDISCONNECT:
 			skip = 1;
 			break;
 

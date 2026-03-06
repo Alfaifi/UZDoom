@@ -1106,7 +1106,11 @@ void D_Display ()
 
 	if (nodrawers || screen == NULL)
 		return; 				// for comparative timing / profiling
-	
+
+	// Mid-game joiner: don't render until DEM_MIDGAMESPAWN fires and spawns our actor.
+	if (consoleplayer < 0 || !playeringame[consoleplayer])
+		return;
+
 	if (!AppActive && !setmodeneeded && !vid_activeinbackground)
 	{
 		return;
@@ -1431,13 +1435,15 @@ void D_DoomLoop ()
 	Subtitle = nullptr;
 	Advisory.SetInvalid();
 
-	vid_cursor->Callback();
+	if (!dedicatedServer)
+		vid_cursor->Callback();
 
 	for (;;)
 	{
 		try
 		{
-			GStrings.SetDefaultGender(players[consoleplayer].userinfo.GetGender()); // cannot be done when the CVAR changes because we don't know if it's for the consoleplayer.
+			if (!dedicatedServer && consoleplayer >= 0 && playeringame[consoleplayer])
+				GStrings.SetDefaultGender(players[consoleplayer].userinfo.GetGender()); // cannot be done when the CVAR changes because we don't know if it's for the consoleplayer.
 
 			// frame syncronous IO operations
 			if (gametic > lasttic)
@@ -1452,7 +1458,8 @@ void D_DoomLoop ()
 			I_StartTic ();
 			D_ProcessEvents();
 			D_Display ();
-			S_UpdateMusic();
+			if (!dedicatedServer)
+				S_UpdateMusic();
 
 			if (gameloop_abort)
 			{
@@ -2991,7 +2998,7 @@ static bool System_DispatchEvent(event_t* ev)
 {
 	shiftState.AddEvent(ev);
 
-	if (ev->type == EV_Mouse && menuactive == MENU_Off && ConsoleState != c_down && ConsoleState != c_falling && !primaryLevel->localEventManager->Responder(ev) && !paused)
+	if (ev->type == EV_Mouse && gamestate == GS_LEVEL && menuactive == MENU_Off && ConsoleState != c_down && ConsoleState != c_falling && !primaryLevel->localEventManager->Responder(ev) && !paused)
 	{
 		if (buttonMap.ButtonDown(Button_Mlook) || freelook)
 		{
@@ -3782,23 +3789,26 @@ static int D_InitGame(const FIWADInfo* iwad_info, std::vector<FileSys::ResourceN
 	// window, or see if we aren't using initializing OpenGL for the
 	// replacement widget framework, or clean up the code to handle
 	// swapping between multiple GL contexts)
-	if (!(restart || norun))
+	if (!(restart || norun || dedicatedServer))
 		V_Init2();
 
-	if (!(batchrun || norun)) Printf ("V_Init: allocate screen.\n");
-	if (!(restart || norun))
+	if (!(batchrun || norun || dedicatedServer)) Printf ("V_Init: allocate screen.\n");
+	if (!(restart || norun || dedicatedServer))
 	{
 		screen->CompileNextShader();
 	}
-	else if(!norun)
+	else if(!norun && !dedicatedServer)
 	{
 		// Update screen palette when restarting
 		screen->UpdatePalette();
 	}
 
-	StartScreen = nostartscreen? nullptr : GetGameStartScreen(per_shader_progress > 0 ? max_progress * 10 / 9 : max_progress + 3);
-	setmodeneeded = true;
-	if (StartScreen != nullptr) StartScreen->Render();
+	if (!dedicatedServer)
+	{
+		StartScreen = nostartscreen? nullptr : GetGameStartScreen(per_shader_progress > 0 ? max_progress * 10 / 9 : max_progress + 3);
+		setmodeneeded = true;
+		if (StartScreen != nullptr) StartScreen->Render();
+	}
 
 	if (norun || batchrun)
 	{
@@ -3815,7 +3825,20 @@ static int D_InitGame(const FIWADInfo* iwad_info, std::vector<FileSys::ResourceN
 	if (cl_customizeinvulmap)
 		R_UpdateInvulnerabilityColormap();
 
-	if (!restart)
+	if (dedicatedServer)
+	{
+		// Dedicated server: skip all screen/rendering init, just start the game.
+		if (!batchrun) Printf ("Init complete (dedicated server).\n");
+
+		if (autostart || netgame)
+		{
+			NoWipe = TICRATE;
+			CheckWarpTransMap(startmap, true);
+			G_InitNew(startmap.GetChars(), false);
+			gameaction = ga_mapwarp;
+		}
+	}
+	else if (!restart)
 	{
 		// start the apropriate game based on parms
 		auto v = Args->CheckValue (FArg_record);
@@ -3878,7 +3901,8 @@ static int D_InitGame(const FIWADInfo* iwad_info, std::vector<FileSys::ResourceN
 			}
 			else
 			{
-				if (gameaction != ga_loadgame && gameaction != ga_loadgamehidecon)
+				if (gameaction != ga_loadgame && gameaction != ga_loadgamehidecon
+					&& gameaction != ga_midgamejoin)
 				{
 					if (autostart || netgame)
 					{
@@ -3994,6 +4018,18 @@ static int D_DoomMain_Internal (void)
 	const char *batchout = Args->CheckValue(FArg_errorlog);
 
 	D_DoomInit();
+
+	// Set up dedicated server mode early so all subsystems can check it.
+	if (Args->CheckParm(FArg_dedicated))
+	{
+		if (!Args->CheckParm(FArg_host))
+			I_FatalError("-dedicated requires -host");
+
+		dedicatedServer = true;
+		nosound = true;
+		nodrawers = true;
+		Printf("Running as dedicated server\n");
+	}
 
 	// [RH] Make sure zdoom.pk3 is always loaded,
 	// as it contains magic stuff we need.
@@ -4158,7 +4194,8 @@ static int D_DoomMain_Internal (void)
 		if (ret != 0) return ret;
 
 		D_DoAnonStats();
-		I_UpdateWindowTitle();
+		if (!dedicatedServer)
+			I_UpdateWindowTitle();
 
 		// Launch debug server if enabled
 		if (should_debug) {
@@ -4203,16 +4240,25 @@ void SignalHandler(int signal)
 
 int GameMain()
 {
-	// On Windows, prefer the native win32 backend.
-	// On other platforms, use SDL until the other backends are more mature.
-	auto zwidget = DisplayBackend::TryCreateWin32();
+	// For dedicated servers, use a null backend that requires no display.
+	std::unique_ptr<DisplayBackend> zwidget;
+	if (Args->CheckParm(FArg_dedicated))
+	{
+		zwidget = DisplayBackend::TryCreateNull();
+	}
+	else
+	{
+		// On Windows, prefer the native win32 backend.
+		// On other platforms, use SDL until the other backends are more mature.
+		zwidget = DisplayBackend::TryCreateWin32();
+		if (!zwidget)
+			zwidget = DisplayBackend::TryCreateSDL2();
+	}
 	if (!zwidget)
-		zwidget = DisplayBackend::TryCreateSDL2();
-	if (!zwidget)
-    {
+	{
 		fprintf(stderr, "Unable to create init zwidget\n");
 		return -1;
-    }
+	}
 	DisplayBackend::Set(std::move(zwidget));
 
 	int ret = 0;

@@ -6480,6 +6480,14 @@ AActor *FLevelLocals::SpawnPlayer (FPlayerStart *mthing, int playernum, int flag
 		mobj->SetZ(mobj->ceilingz - mobj->Height, false);
 	}
 
+	// Dedicated server ghost player (slot 0): make invisible and non-interactive
+	// so it doesn't block real players or appear as a visible model.
+	if ((dedicatedServer || hostIsDedicated) && playernum == 0)
+	{
+		mobj->renderflags |= RF_INVISIBLE;
+		mobj->flags &= ~(MF_SOLID | MF_SHOOTABLE);
+	}
+
 	// [BC] Do script stuff
 	if (!(flags & SPF_TEMPPLAYER) || oldactor == nullptr)
 	{
@@ -6646,17 +6654,22 @@ AActor *FLevelLocals::SpawnMapThing (FMapThing *mthing, int position)
 		else if (!deathmatch)
 		{ // Cooperative
 			mask = 0;
+			bool anyPlayers = false;
 			for (unsigned int i = 0; i < MAXPLAYERS; i++)
 			{
 				if (PlayerInGame(i))
 				{
+					anyPlayers = true;
 					int spawnmask = Players[i]->GetSpawnClass();
 					if (spawnmask != 0)
 						mask |= spawnmask;
-					else 
+					else
 						mask = -1;
 				}
 			}
+			// If no players in game (dedicated server pre-join), spawn everything.
+			if (!anyPlayers)
+				mask = -1;
 			if (mask != -1 && (mthing->ClassFilter & mask) == 0)
 			{
 				return NULL;

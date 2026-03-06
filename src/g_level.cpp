@@ -636,7 +636,9 @@ void G_InitNew (const char *mapname, bool bTitleLevel)
 
 		// force players to be initialized upon first level load
 		for (i = 0; i < MAXPLAYERS; i++)
+		{
 			players[i].playerstate = PST_ENTER;	// [BC]
+		}
 
 		STAT_StartNewGame(mapname);
 		GameUUID = GenerateUUID();
@@ -1530,7 +1532,8 @@ void FLevelLocals::DoLoadLevel(const FString &nextmapname, int position, bool au
 		Behaviors.StartTypedScripts(SCRIPT_Reopen, NULL, false);
 	}
 
-	StatusBar->AttachToPlayer (&players[consoleplayer]);
+	if (playeringame[consoleplayer])
+		StatusBar->AttachToPlayer (&players[consoleplayer]);
 	//      unsafe world load
 	staticEventManager.WorldLoaded();
 	//      regular world load (savegames are handled internally)

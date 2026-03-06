@@ -164,6 +164,19 @@ public:
 	static FRandom *StaticFindRNG(const char *name, bool client);
 	static void RollbackRNGState(FSerializer& arc);
 
+	// Binary serialization for mid-game state transfer (no FSerializer dependency).
+	static void StaticWriteRNGBinary(TArray<uint8_t>& out);
+	static void StaticReadRNGBinary(const uint8_t* data, size_t len);
+
+	// Debug: checksum all game RNG states.
+	static uint32_t StaticSumAllSeeds()
+	{
+		uint32_t sum = 0;
+		for (FRandom* rng = RNGList; rng != nullptr; rng = rng->Next)
+			sum += (uint32_t)rng->Seed();
+		return sum;
+	}
+
 #ifndef NDEBUG
 	static void StaticPrintSeeds ();
 #endif

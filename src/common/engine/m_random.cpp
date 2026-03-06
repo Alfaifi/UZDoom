@@ -399,6 +399,133 @@ void FRandom::RollbackRNGState(FSerializer& arc)
 
 //==========================================================================
 //
+// Big-endian read/write helpers for binary RNG serialization.
+//
+//==========================================================================
+
+static inline void WriteBE32(uint8_t* p, uint32_t v)
+{
+	p[0] = (v >> 24) & 0xFF;
+	p[1] = (v >> 16) & 0xFF;
+	p[2] = (v >> 8) & 0xFF;
+	p[3] = v & 0xFF;
+}
+
+static inline uint32_t ReadBE32(const uint8_t* p)
+{
+	return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3];
+}
+
+//==========================================================================
+//
+// FRandom :: StaticWriteRNGBinary
+//
+// Serializes the full state of every named RNG into a binary buffer.
+// Format: [rngseed:4] [count:4] { [NameCRC:4] [idx:4] [sfmt.u:N32*4] }*
+//
+//==========================================================================
+
+void FRandom::StaticWriteRNGBinary(TArray<uint8_t>& out)
+{
+	// Count named RNGs.
+	uint32_t count = 0;
+	for (FRandom* rng = RNGList; rng != nullptr; rng = rng->Next)
+	{
+		if (rng->NameCRC != 0)
+			count++;
+	}
+
+	constexpr size_t stateBytes = SFMT::N32 * sizeof(uint32_t);
+	constexpr size_t perRNG = 4 + 4 + stateBytes; // NameCRC + idx + sfmt.u
+	const size_t totalSize = 4 + 4 + count * perRNG; // rngseed + count + RNGs
+	out.Resize((unsigned)totalSize);
+	uint8_t* p = out.Data();
+
+	WriteBE32(p, rngseed);
+	p += 4;
+
+	WriteBE32(p, count);
+	p += 4;
+
+	// Write each named RNG.
+	for (FRandom* rng = RNGList; rng != nullptr; rng = rng->Next)
+	{
+		if (rng->NameCRC == 0)
+			continue;
+
+		WriteBE32(p, rng->NameCRC);
+		p += 4;
+
+		WriteBE32(p, (uint32_t)rng->idx);
+		p += 4;
+
+		// sfmt.u state array (big-endian for cross-platform compatibility)
+		for (size_t j = 0; j < SFMT::N32; j++)
+		{
+			WriteBE32(p, rng->sfmt.u[j]);
+			p += 4;
+		}
+	}
+}
+
+//==========================================================================
+//
+// FRandom :: StaticReadRNGBinary
+//
+// Restores the full state of every named RNG from a binary buffer
+// produced by StaticWriteRNGBinary.
+//
+//==========================================================================
+
+void FRandom::StaticReadRNGBinary(const uint8_t* data, size_t len)
+{
+	if (len < 8)
+		return;
+
+	const uint8_t* p = data;
+
+	rngseed = ReadBE32(p);
+	p += 4;
+
+	// Initialize all RNGs from the seed first (handles any new RNGs not in the data).
+	FRandom::StaticClearRandom();
+
+	uint32_t count = ReadBE32(p);
+	p += 4;
+
+	constexpr size_t stateBytes = SFMT::N32 * sizeof(uint32_t);
+	constexpr size_t perRNG = 4 + 4 + stateBytes;
+
+	for (uint32_t i = 0; i < count; i++)
+	{
+		if ((size_t)(p - data) + perRNG > len)
+			break;
+
+		uint32_t crc = ReadBE32(p);
+		p += 4;
+
+		uint32_t uidx = ReadBE32(p);
+		p += 4;
+
+		// Find the matching RNG and restore its state.
+		for (FRandom* rng = RNGList; rng != nullptr; rng = rng->Next)
+		{
+			if (rng->NameCRC == crc)
+			{
+				rng->idx = (int)uidx;
+				if (rng->idx < 0 || rng->idx > (int)SFMT::N32)
+					rng->idx = SFMT::N32; // force regeneration on next use
+				for (size_t j = 0; j < SFMT::N32; j++)
+					rng->sfmt.u[j] = ReadBE32(&p[j * 4]);
+				break;
+			}
+		}
+		p += stateBytes;
+	}
+}
+
+//==========================================================================
+//
 // FRandom :: StaticPrintSeeds
 //
 // Prints a snapshot of the current RNG states. This is probably wrong.

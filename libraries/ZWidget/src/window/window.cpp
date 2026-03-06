@@ -199,3 +199,10 @@ std::unique_ptr<DisplayBackend> DisplayBackend::TryCreateWayland()
 }
 
 #endif
+
+#include "null/null_display_backend.h"
+
+std::unique_ptr<DisplayBackend> DisplayBackend::TryCreateNull()
+{
+	return std::make_unique<NullDisplayBackend>();
+}

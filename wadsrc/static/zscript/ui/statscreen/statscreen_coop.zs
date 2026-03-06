@@ -309,7 +309,7 @@ class CoopStatusScreen : StatusScreen
 		// Draw lines for each player
 		for (i = 0; i < MAXPLAYERS; ++i)
 		{
-			if (!playeringame[i])
+			if (!playeringame[i] || PlayerInfo.IsGhostPlayer(i))
 				continue;
 
 			PlayerInfo player = players[i];

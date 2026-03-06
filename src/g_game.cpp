@@ -47,6 +47,7 @@
 #include "g_game.h"
 #include "g_hub.h"
 #include "g_levellocals.h"
+#include "g_mapinfo.h"
 #include "gi.h"
 #include "gstrings.h"
 #include "hu_stuff.h"
@@ -117,12 +118,19 @@ CVAR (Bool, cl_restartondeath, false, CVAR_ARCHIVE | CVAR_GLOBALCONFIG);
 EXTERN_CVAR (Float, con_midtime);
 EXTERN_CVAR(Int, net_disablepause);
 EXTERN_CVAR(Bool, net_limitsaves);
+EXTERN_CVAR(Float, maxviewpitch);
+EXTERN_CVAR(Bool, cl_oldfreelooklimit);
 
 FARG(nodraw, "Debug", "Stops the game from drawing anything.", "",
 	"Causes ZDoom not to draw anything at all. Only useful with -timedemo.");
 FARG(noblit, "Debug", "Prevents the screen from updating.", "",
 	"Causes ZDoom not to update the display on the screen, but it still draws everything to an"
 	" internal buffer. Only useful with -timedemo.");
+
+static inline uint32_t ReadBE32(const uint8_t* p)
+{
+	return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3];
+}
 
 //==========================================================================
 //
@@ -158,6 +166,7 @@ bool 			noblit; 				// for comparative timing purposes
 
 bool	 		viewactive;
 
+bool			dedicatedServer;				// Running as headless dedicated server
 bool			multiplayernext = false;		// [SP] Map coop/dm implementation
 player_t		players[MAXPLAYERS];
 bool			playeringame[MAXPLAYERS];
@@ -838,6 +847,8 @@ void G_BuildTiccmd (usercmd_t *cmd)
 static int LookAdjust(int look)
 {
 	look <<= 16;
+	if (consoleplayer < 0 || !playeringame[consoleplayer])
+		return look;
 	if (players[consoleplayer].playerstate != PST_DEAD &&		// No adjustment while dead.
 		players[consoleplayer].ReadyWeapon != NULL)			// No adjustment if no weapon.
 	{
@@ -1258,6 +1269,11 @@ void G_Ticker ()
 			break;
 
 
+
+		case ga_midgamejoin:
+			// Handled in TryRunTics() outside the lockstep — the joining client
+			// is blocked at tics=0 so G_Ticker() can't run it.
+			break;
 
 		default:
 		case ga_nothing:
@@ -1987,6 +2003,181 @@ void C_SerializeCVars(FSerializer& arc, const char* label, uint32_t filter)
 void SetupLoadingCVars();
 void FinishLoadingCVars();
 bool CheckGZDoomSaveCompat(FString &engine, FString &software);
+
+//==========================================================================
+//
+// G_DoMidgameJoin
+//
+// Called when the joining client has received the full game state snapshot
+// from the dedicated server. Loads the snapshot and enters the game.
+//
+//==========================================================================
+
+static bool bMidgameStateRequested = false;
+static uint64_t midgameJoinStartTime = 0;
+
+void G_AbortMidgameJoin()
+{
+	gameaction = ga_fullconsole;
+	bMidgameStateRequested = false;
+	midgameJoinStartTime = 0;
+	IncomingStateTransfer.Clear();
+}
+
+void G_DoMidgameJoin()
+{
+	// Timeout: if the host hasn't completed the transfer within 90 seconds,
+	// give up. This is slightly longer than the host's 60s transfer timeout
+	// so the host can abort first under normal conditions.
+	if (midgameJoinStartTime > 0 && (I_msTime() - midgameJoinStartTime) >= 90000)
+	{
+		Printf("Mid-game join timed out (no response from host)\n");
+		G_AbortMidgameJoin();
+		return;
+	}
+
+	auto& xfer = IncomingStateTransfer;
+	if (xfer.data.Size() == 0)
+	{
+		// No state data yet. Request it from the host (once).
+		// This runs after V_Init2/shaders are done, so the host takes
+		// a fresh snapshot that minimizes the gap before DEM_MIDGAMESPAWN.
+		if (!bMidgameStateRequested)
+		{
+			Printf("Requesting game state from host...\n");
+			uint8_t buf[2] = { NCMD_SETUP, PRE_MIDGAME_STATE_READY };
+			I_SendSetupPacket(Net_Arbitrator, buf, 2);
+			bMidgameStateRequested = true;
+			midgameJoinStartTime = I_msTime();
+		}
+		return;
+	}
+
+	// Wait until all chunks have been received. The data buffer is allocated
+	// when STATE_BEGIN arrives, but chunks may still be in flight. The active
+	// flag is cleared by HandleMidgameStateComplete when all chunks arrive.
+	if (xfer.active)
+		return;
+
+	// State data fully received — proceed with loading.
+	gameaction = ga_nothing;
+	bMidgameStateRequested = false;
+	midgameJoinStartTime = 0;
+
+	Printf("Loading mid-game state for %s...\n", xfer.mapName.GetChars());
+
+	// Store the snapshot data into the level info so UnSnapshotLevel can find it.
+	auto* info = FindLevelInfo(xfer.mapName.GetChars());
+	if (!info)
+	{
+		Printf("G_DoMidgameJoin: unknown map %s\n", xfer.mapName.GetChars());
+		xfer.Clear();
+		return;
+	}
+
+	// Transfer data format: [globals (RNG state)] [snapshot header (16)] [compressed snapshot]
+	// The globals portion contains binary-serialized RNG state from the server.
+	const size_t globalsSize = xfer.globalsSize;
+	const size_t totalSize = xfer.data.Size();
+	const size_t snapshotHeaderSize = 16;
+
+	// Validate that the globals + snapshot header fit within the transfer buffer.
+	if (globalsSize + snapshotHeaderSize > totalSize)
+	{
+		Printf("G_DoMidgameJoin: transfer data too small (total=%zu, globals=%zu)\n", totalSize, globalsSize);
+		xfer.Clear();
+		return;
+	}
+
+	const uint8_t* snapshotStart = xfer.data.Data() + globalsSize;
+
+	// Reconstruct the FCompressedBuffer from the snapshot portion.
+	info->Snapshot.Clean();
+	const uint8_t* hdr = snapshotStart;
+	info->Snapshot.mSize = ReadBE32(&hdr[0]);
+	info->Snapshot.mCompressedSize = ReadBE32(&hdr[4]);
+	info->Snapshot.mMethod = (int)ReadBE32(&hdr[8]);
+	info->Snapshot.mCRC32 = ReadBE32(&hdr[12]);
+
+	// Validate that the compressed data fits within the transfer buffer.
+	if (globalsSize + snapshotHeaderSize + info->Snapshot.mCompressedSize > totalSize)
+	{
+		Printf("G_DoMidgameJoin: snapshot size exceeds transfer buffer (comp=%zu, avail=%zu)\n",
+			   info->Snapshot.mCompressedSize, totalSize - globalsSize - snapshotHeaderSize);
+		xfer.Clear();
+		return;
+	}
+
+	info->Snapshot.mBuffer = new char[info->Snapshot.mCompressedSize];
+	memcpy(info->Snapshot.mBuffer, snapshotStart + snapshotHeaderSize, info->Snapshot.mCompressedSize);
+
+	// The joiner is NOT in the game yet — their slot will be activated via
+	// DEM_MIDGAMESPAWN after we signal STATE_LOADED.
+	playeringame[consoleplayer] = false;
+
+	// Load the map with the snapshot. Setting savegamerestore triggers
+	// UnSnapshotLevel() inside G_InitNew(). Note: G_InitNew calls
+	// StaticClearRandom() which resets RNG — we restore it below.
+	savegamerestore = true;
+	G_InitNew(xfer.mapName.GetChars(), false);
+	savegamerestore = false;
+
+	// Fix pitch limits for all players. ReadOnePlayer sets MinPitch=MaxPitch=
+	// current pitch as a temporary measure (the real limits arrive via
+	// DEM_SETPITCHLIMIT from each player's console). For a mid-game joiner,
+	// remote players never re-send their pitch limits, so fix them now using
+	// the local renderer's pitch range.
+	{
+		int uppitch, downpitch;
+		if (!V_IsHardwareRenderer())
+		{
+			int maxvp = min(56, (int)maxviewpitch);
+			int maxup = min(32, (int)maxviewpitch);
+			uppitch = cl_oldfreelooklimit ? maxup : maxvp;
+			downpitch = maxvp;
+		}
+		else
+		{
+			uppitch = downpitch = (int)maxviewpitch;
+		}
+		for (int i = 0; i < MAXPLAYERS; ++i)
+		{
+			if (playeringame[i] && players[i].mo)
+			{
+				players[i].MinPitch = DAngle::fromDeg(-(double)uppitch);
+				players[i].MaxPitch = DAngle::fromDeg((double)downpitch);
+			}
+		}
+	}
+
+	// Restore the exact RNG state from the server at snapshot time.
+	// This must happen AFTER G_InitNew (which calls StaticClearRandom).
+	if (globalsSize > 0)
+	{
+		FRandom::StaticReadRNGBinary(xfer.data.Data(), globalsSize);
+	}
+
+	// Synchronize network state with the host.
+	Net_PrepareMidgameSync();
+
+	// Signal to the host that we've loaded successfully.
+	xfer.loadedSent = true;
+	uint8_t buf[2] = { NCMD_SETUP, PRE_MIDGAME_STATE_LOADED };
+	I_SendSetupPacket(Net_Arbitrator, buf, 2);
+
+	// Clean up — but loadedSent persists so HandleMidgameStateComplete
+	// can resend STATE_LOADED if the host missed our first one.
+	xfer.active = false;
+	xfer.data.Clear();
+	xfer.totalSize = 0;
+	xfer.globalsSize = 0;
+	xfer.mapName = "";
+	xfer.numChunks = 0;
+	xfer.nextExpectedChunk = 0;
+	info->Snapshot.Clean();
+
+	Printf("Mid-game state loaded, waiting for spawn...\n");
+}
 
 void G_DoLoadGame ()
 {

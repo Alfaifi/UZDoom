@@ -247,7 +247,8 @@ void I_InitSound ()
 {
 	FModule_SetProgDir(progdir.GetChars());
 	/* Get command line options: */
-	nosound = !!Args->CheckParm (FArg_nosound);
+	extern bool dedicatedServer;
+	nosound = !!Args->CheckParm (FArg_nosound) || dedicatedServer;
 	nosfx = !!Args->CheckParm (FArg_nosfx);
 
 	GSnd = NULL;

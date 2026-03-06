@@ -73,6 +73,8 @@ void G_TimeDemo (const char* name);
 bool G_CheckDemoStatus (void);
 
 void G_Ticker (void);
+void G_DoMidgameJoin();
+void G_AbortMidgameJoin();
 bool G_Responder (event_t*	ev);
 
 enum

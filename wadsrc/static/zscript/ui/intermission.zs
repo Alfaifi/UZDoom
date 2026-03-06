@@ -48,7 +48,7 @@ extend class ScreenJobRunner
 			int totalClients, readyClients;
 			for (int i; i < MAXPLAYERS; ++i)
 			{
-				if (!playerInGame[i] || players[i].Bot)
+				if (!playerInGame[i] || players[i].Bot || PlayerInfo.IsGhostPlayer(i))
 					continue;
 
 				++totalClients;

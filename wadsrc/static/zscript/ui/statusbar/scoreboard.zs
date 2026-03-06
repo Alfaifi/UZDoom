@@ -63,6 +63,9 @@ extend class BaseStatusBar
 		int pNum = -1;
 		while ((pNum = PlayerInfo.GetNextPlayerNumber(pNum)) != -1)
 		{
+			if (PlayerInfo.IsGhostPlayer(pNum))
+				continue;
+
 			int i;
 			for (; i < sorted.Size(); ++i)
 			{

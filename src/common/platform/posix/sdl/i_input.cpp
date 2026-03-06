@@ -33,6 +33,7 @@
 #include "d_eventbase.h"
 #include "d_gui.h"
 #include "dikeys.h"
+#include "i_net.h"
 #include "engineerrors.h"
 #include "i_input.h"
 #include "i_interface.h"
@@ -683,6 +684,7 @@ void I_GetEvent ()
 
 void I_StartTic ()
 {
+	if (Args->CheckParm(FArg_dedicated)) return;
 	I_CheckGUICapture ();
 	I_CheckNativeMouse ();
 	I_GetEvent ();
@@ -692,5 +694,6 @@ void I_StartTic ()
 void I_ProcessJoysticks ();
 void I_StartFrame ()
 {
+	if (Args->CheckParm(FArg_dedicated)) return;
 	I_ProcessJoysticks();
 }

@@ -1049,6 +1049,19 @@ DEFINE_ACTION_FUNCTION_NATIVE(_PlayerInfo, GetNextPlayerNumber, player_t::GetNex
 	ACTION_RETURN_INT(player_t::GetNextPlayerNumber(pNum, noBots));
 }
 
+static int IsGhostPlayer(int pNum)
+{
+	return (dedicatedServer || hostIsDedicated) && pNum == 0;
+}
+
+DEFINE_ACTION_FUNCTION_NATIVE(_PlayerInfo, IsGhostPlayer, IsGhostPlayer)
+{
+	PARAM_PROLOGUE;
+	PARAM_INT(pNum);
+
+	ACTION_RETURN_BOOL(IsGhostPlayer(pNum));
+}
+
 static int GetFullbrightMode(player_t* self)
 {
 	return self->GetFullbrightMode();

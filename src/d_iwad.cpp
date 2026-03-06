@@ -820,9 +820,13 @@ int FIWadManager::IdentifyVersion (std::vector<FileSys::ResourceName>&wadfiles, 
 	int pick = 0;
 
 	// Present the IWAD selection box.
-	bool alwaysshow = (queryiwad && !Args->CheckParm(FArg_iwad) && !foundprio);
+	// Dedicated servers are headless — never show the interactive picker.
+	// The IWAD is either specified via -iwad, a response file (@server.txt),
+	// or defaults to the first one found.
+	bool alwaysshow = (queryiwad && !Args->CheckParm(FArg_iwad) && !foundprio
+		&& !Args->CheckParm(FArg_dedicated));
 
-	if (!havepicked && (alwaysshow || picks.Size() > 1))
+	if (!havepicked && !Args->CheckParm(FArg_dedicated) && (alwaysshow || picks.Size() > 1))
 	{
 		TArray<WadStuff> wads;
 		for (auto & found : picks)
