@@ -25,8 +25,8 @@ LauncherButtonbar::LauncherButtonbar(LauncherWindow* parent) : Widget(parent)
 	PlayButton = new PushButton(this);
 	ExitButton = new PushButton(this);
 
-	PlayButton->OnClick = [=]() { OnPlayButtonClicked(); };
-	ExitButton->OnClick = [=]() { OnExitButtonClicked(); };
+	PlayButton->OnClick = [this]() { OnPlayButtonClicked(); };
+	ExitButton->OnClick = [this]() { OnExitButtonClicked(); };
 }
 
 void LauncherButtonbar::UpdateLanguage()

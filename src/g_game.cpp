@@ -2140,7 +2140,7 @@ void G_DoMidgameJoin()
 		{
 			uppitch = downpitch = (int)maxviewpitch;
 		}
-		for (int i = 0; i < MAXPLAYERS; ++i)
+		for (size_t i = 0; i < MAXPLAYERS; ++i)
 		{
 			if (playeringame[i] && players[i].mo)
 			{
@@ -3138,7 +3138,7 @@ void G_DoPlayDemo (void)
 		}
 		size_t demolen = fr.GetLength();
 		demobuffer.Resize(demolen);
-		if (fr.Read(demobuffer.Data(), demolen) != demolen)
+		if (fr.Read(demobuffer.Data(), demolen) != (ptrdiff_t)demolen)
 		{
 			I_Error("Unable to read demo '%s'", defdemoname.GetChars());
 		}

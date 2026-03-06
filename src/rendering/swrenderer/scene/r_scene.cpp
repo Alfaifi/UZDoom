@@ -298,7 +298,7 @@ namespace swrenderer
 			std::unique_ptr<RenderThread> thread(new RenderThread(this, false));
 			auto renderthread = thread.get();
 			int start_run_id = run_id;
-			thread->thread = std::thread([=]()
+			thread->thread = std::thread([this, renderthread, start_run_id]()
 			{
 				int last_run_id = start_run_id;
 				while (true)
