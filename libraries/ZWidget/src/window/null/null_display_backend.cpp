@@ -1,5 +1,6 @@
 #include "null_display_backend.h"
 #include <thread>
+#include <vector>
 
 std::unique_ptr<DisplayWindow> NullDisplayBackend::Create(DisplayWindowHost* windowHost, bool popupWindow, DisplayWindow* owner, RenderAPI renderAPI)
 {
@@ -16,14 +17,28 @@ void NullDisplayBackend::RunLoop()
 	while (!exitRunLoop)
 	{
 		auto now = std::chrono::steady_clock::now();
+
+		// Collect ready timer IDs first — callbacks may call StopTimer()
+		// which erases from the map, invalidating iterators.
+		std::vector<int> ready;
 		for (auto& [id, entry] : timers)
 		{
 			if (now >= entry.nextFire)
+				ready.push_back(id);
+		}
+		for (int id : ready)
+		{
+			auto it = timers.find(id);
+			if (it != timers.end())
 			{
-				entry.callback();
-				entry.nextFire = now + std::chrono::milliseconds(entry.intervalMs);
+				it->second.callback();
+				// Re-lookup: callback may have stopped this or other timers.
+				it = timers.find(id);
+				if (it != timers.end())
+					it->second.nextFire = now + std::chrono::milliseconds(it->second.intervalMs);
 			}
 		}
+
 		std::this_thread::sleep_for(std::chrono::milliseconds(4));
 	}
 }

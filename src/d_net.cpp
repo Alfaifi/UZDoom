@@ -1186,7 +1186,9 @@ void HandleMidgameConnect()
 
 	// Validate password.
 	const bool hasPassword = strlen(net_password) > 0;
-	if (hasPassword && strcmp(net_password, (const char*)&NetBuffer[2u + passwordOffset]))
+	if (hasPassword && (2u + passwordOffset >= (size_t)NetBufferLength
+		|| memchr(&NetBuffer[2u + passwordOffset], '\0', NetBufferLength - 2u - passwordOffset) == nullptr
+		|| strcmp(net_password, (const char*)&NetBuffer[2u + passwordOffset])))
 	{
 		uint8_t buf[3] = { NCMD_SETUP, PRE_MIDGAME_REJECT, REJECT_PASSWORD };
 		I_SendSetupPacketToAddress(buf, 3);
@@ -2027,6 +2029,8 @@ static void GetPackets()
 			for (int i = 0; i < numPlayers; ++i)
 			{
 				int quitNum = NetBuffer[curByte++];
+				if (quitNum >= (int)MAXPLAYERS)
+					continue;
 				// Network bookkeeping only — remove from the client list and
 				// clear tracking masks so the lockstep doesn't stall. The
 				// actual game state change (PST_GONE, actor destruction) is
