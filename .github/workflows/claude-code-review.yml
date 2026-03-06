@@ -38,7 +38,14 @@ jobs:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           plugin_marketplaces: 'https://github.com/anthropics/claude-code.git'
           plugins: 'code-review@claude-code-plugins'
-          prompt: '/code-review:code-review ${{ github.repository }}/pull/${{ github.event.pull_request.number }}'
+          prompt: |
+            /code-review:code-review ${{ github.repository }}/pull/${{ github.event.pull_request.number }}
+
+            IMPORTANT: After generating the review, you MUST post it as a PR comment using this command:
+            gh pr comment ${{ github.event.pull_request.number }} --repo ${{ github.repository }} --body "$(cat <<'EOF'
+            YOUR_REVIEW_HERE
+            EOF
+            )"
           claude_args: '--allowed-tools "Bash,Read,Grep,Glob"'
           show_full_output: true
           # See https://github.com/anthropics/claude-code-action/blob/main/docs/usage.md
