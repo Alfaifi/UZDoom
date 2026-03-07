@@ -2045,8 +2045,26 @@ void G_DoMidgameJoin()
 		if (!bMidgameStateRequested)
 		{
 			Printf("Requesting game state from host...\n");
-			uint8_t buf[2] = { NCMD_SETUP, PRE_MIDGAME_STATE_READY };
-			I_SendSetupPacket(Net_Arbitrator, buf, 2);
+			uint8_t buf[MAX_MSGLEN];
+			size_t pos = 0;
+			buf[pos++] = NCMD_SETUP;
+			buf[pos++] = PRE_MIDGAME_STATE_READY;
+
+			// Send our initial userinfo so the host can propagate the
+			// late joiner's name, skin, and colors before DEM_MIDGAMESPAWN.
+			const FString userinfo = D_GetUserInfoStrings(consoleplayer, true);
+			const size_t userinfoSize = userinfo.Len() + 1;
+			if (pos + userinfoSize > MAX_MSGLEN)
+			{
+				Printf("G_DoMidgameJoin: userinfo too large (%zu bytes)\n", userinfoSize);
+				G_AbortMidgameJoin();
+				return;
+			}
+
+			memcpy(&buf[pos], userinfo.GetChars(), userinfoSize);
+			pos += userinfoSize;
+
+			I_SendSetupPacket(Net_Arbitrator, buf, pos);
 			bMidgameStateRequested = true;
 			midgameJoinStartTime = I_msTime();
 		}
@@ -2117,10 +2135,18 @@ void G_DoMidgameJoin()
 
 	// Load the map with the snapshot. Setting savegamerestore triggers
 	// UnSnapshotLevel() inside G_InitNew(). Note: G_InitNew calls
-	// StaticClearRandom() which resets RNG — we restore it below.
+	// StaticClearRandom() which resets RNG; we restore it below.
 	savegamerestore = true;
 	G_InitNew(xfer.mapName.GetChars(), false);
 	savegamerestore = false;
+
+	// Snapshot loading restores userinfo, but the palette translations still
+	// need to be rebuilt locally so existing players keep their skin colors.
+	for (size_t i = 0; i < MAXPLAYERS; ++i)
+	{
+		if (playeringame[i])
+			R_BuildPlayerTranslation((int)i);
+	}
 
 	// Fix pitch limits for all players. ReadOnePlayer sets MinPitch=MaxPitch=
 	// current pitch as a temporary measure (the real limits arrive via

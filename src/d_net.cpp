@@ -1336,6 +1336,17 @@ void HandleMidgamePlayerJoin()
 		return;
 
 	const int newPlayer = NetBuffer[2];
+	if (newPlayer < 0 || newPlayer >= (int)MAXPLAYERS)
+		return;
+
+	// Duplicate join notifications can carry the joiner's finalized userinfo
+	// once the host has it, so always apply any appended payload first.
+	if (NetBufferLength > 3)
+	{
+		TArrayView<uint8_t> stream = TArrayView(&NetBuffer[3], NetBufferLength - 3);
+		D_ReadUserInfoStrings(newPlayer, stream, false);
+	}
+
 	if (NetworkClients.InGame(newPlayer))
 	{
 		// Already know about this player (retransmitted PLAYER_JOIN). Just ACK again.
@@ -1734,6 +1745,12 @@ void HandleMidgameStateReady()
 	if (PendingStateTransfer.active)
 		return; // Already transferring state to someone.
 
+	if (NetBufferLength > 2)
+	{
+		TArrayView<uint8_t> stream = TArrayView(&NetBuffer[2], NetBufferLength - 2);
+		D_ReadUserInfoStrings(joinerSlot, stream, false);
+	}
+
 	Printf("Client %d ready for state, taking snapshot...\n", joinerSlot);
 	BeginStateTransfer(joinerSlot);
 }
@@ -1758,14 +1775,28 @@ void HandleMidgameStateLoaded()
 	Printf("Client %d loaded game state, spawning player\n", joinerSlot);
 
 	// Notify all existing clients that a new player is joining.
-	uint8_t buf[3];
-	buf[0] = NCMD_SETUP;
-	buf[1] = PRE_MIDGAME_PLAYER_JOIN;
-	buf[2] = static_cast<uint8_t>(joinerSlot);
+	uint8_t buf[MAX_MSGLEN];
+	size_t pos = 0;
+	buf[pos++] = NCMD_SETUP;
+	buf[pos++] = PRE_MIDGAME_PLAYER_JOIN;
+	buf[pos++] = static_cast<uint8_t>(joinerSlot);
+
+	const FString userinfo = D_GetUserInfoStrings(joinerSlot, true);
+	const size_t userinfoSize = userinfo.Len() + 1;
+	if (pos + userinfoSize > MAX_MSGLEN)
+	{
+		Printf("HandleMidgameStateLoaded: userinfo too large for player %d (%zu bytes)\n", joinerSlot, userinfoSize);
+	}
+	else
+	{
+		memcpy(&buf[pos], userinfo.GetChars(), userinfoSize);
+		pos += userinfoSize;
+	}
+
 	for (auto c : NetworkClients)
 	{
 		if (c != consoleplayer && c != joinerSlot)
-			I_SendSetupPacket(c, buf, 3);
+			I_SendSetupPacket(c, buf, pos);
 	}
 
 	// Inject DEM_MIDGAMESPAWN into the host's event stream.
