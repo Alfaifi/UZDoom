@@ -90,6 +90,8 @@ void G_StartSlideshow(FLevelLocals *Level, FName whichone, int state);
 
 class FSerializer;
 bool G_CheckSaveGameWads (FSerializer &arc, bool printwarn);
+void G_SerializeMidgameGlobalsPreInit(FSerializer& arc);
+void G_SerializeMidgameGlobalsPostInit(FSerializer& arc);
 
 enum EFinishLevelType
 {

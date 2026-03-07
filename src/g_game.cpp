@@ -1999,6 +1999,64 @@ void C_SerializeCVars(FSerializer& arc, const char* label, uint32_t filter)
 	}
 }
 
+static void SerializeRestorableServerCVars(FSerializer& arc)
+{
+	if (arc.isReading())
+	{
+		FString cvar;
+		arc("importantcvars", cvar);
+		if (!cvar.IsEmpty())
+		{
+			auto vars_p = cvar.GetTArrayView();
+			C_ReadCVars(vars_p);
+		}
+		else
+		{
+			C_SerializeCVars(arc, "servercvars", CVAR_SERVERINFO);
+		}
+	}
+	else
+	{
+		C_SerializeCVars(arc, "servercvars", CVAR_SERVERINFO);
+	}
+}
+
+void G_SerializeMidgameGlobalsPreInit(FSerializer& arc)
+{
+	G_SerializeHub(arc);
+	SerializeRestorableServerCVars(arc);
+
+	arc("globalfreeze", globalfreeze)
+		("startpos", startpos)
+		("laststartpos", laststartpos);
+
+	if (arc.isWriting())
+		G_WriteVisited(arc);
+	else
+		G_ReadVisited(arc);
+}
+
+void G_SerializeMidgameGlobalsPostInit(FSerializer& arc)
+{
+	if (arc.isWriting())
+	{
+		FRandom::StaticWriteRNGState(arc);
+		P_WriteACSDefereds(arc);
+		P_WriteACSVars(arc);
+		if (NextSkill != -1)
+			arc("nextskill", NextSkill);
+	}
+	else
+	{
+		FRandom::StaticReadRNGState(arc);
+		P_ReadACSDefereds(arc);
+		P_ReadACSVars(arc);
+
+		NextSkill = -1;
+		arc("nextskill", NextSkill);
+	}
+}
+
 
 void SetupLoadingCVars();
 void FinishLoadingCVars();
@@ -2093,8 +2151,7 @@ void G_DoMidgameJoin()
 		return;
 	}
 
-	// Transfer data format: [globals (RNG state)] [snapshot header (16)] [compressed snapshot]
-	// The globals portion contains binary-serialized RNG state from the server.
+	// Transfer data format: [globals JSON blob] [snapshot header (16)] [compressed snapshot]
 	const size_t globalsSize = xfer.globalsSize;
 	const size_t totalSize = xfer.data.Size();
 	const size_t snapshotHeaderSize = 16;
@@ -2129,6 +2186,18 @@ void G_DoMidgameJoin()
 	info->Snapshot.mBuffer = new char[info->Snapshot.mCompressedSize];
 	memcpy(info->Snapshot.mBuffer, snapshotStart + snapshotHeaderSize, info->Snapshot.mCompressedSize);
 
+	FSerializer globalsArc;
+	if (globalsSize > 0 && !globalsArc.OpenReader(reinterpret_cast<const char*>(xfer.data.Data()), globalsSize))
+	{
+		Printf("G_DoMidgameJoin: failed to open globals blob (%zu bytes)\n", globalsSize);
+		info->Snapshot.Clean();
+		xfer.Clear();
+		return;
+	}
+
+	if (globalsSize > 0)
+		G_SerializeMidgameGlobalsPreInit(globalsArc);
+
 	// The joiner is NOT in the game yet — their slot will be activated via
 	// DEM_MIDGAMESPAWN after we signal STATE_LOADED.
 	playeringame[consoleplayer] = false;
@@ -2139,6 +2208,24 @@ void G_DoMidgameJoin()
 	savegamerestore = true;
 	G_InitNew(xfer.mapName.GetChars(), false);
 	savegamerestore = false;
+
+	// Automap discovery is local in normal multiplayer. A late joiner should
+	// start with no personal ML_MAPPED state instead of inheriting any host
+	// snapshot data, while ML_REVEALED and all-map effects remain intact.
+	for (auto& line : primaryLevel->lines)
+		line.flags &= ~ML_MAPPED;
+	for (auto& sub : primaryLevel->subsectors)
+		sub.flags &= ~SSECMF_DRAWN;
+
+	if (primaryLevel->automap != nullptr)
+	{
+		// The dedicated host serializes automap runtime state with no real
+		// display attached, so rebuild the automap from the local client's
+		// current resolution instead of trusting the snapshot values.
+		primaryLevel->automap->LevelInit();
+		primaryLevel->automap->ResetFollowLocation();
+		primaryLevel->automap->UpdateShowAllLines();
+	}
 
 	// Snapshot loading restores userinfo, but the palette translations still
 	// need to be rebuilt locally so existing players keep their skin colors.
@@ -2176,11 +2263,12 @@ void G_DoMidgameJoin()
 		}
 	}
 
-	// Restore the exact RNG state from the server at snapshot time.
-	// This must happen AFTER G_InitNew (which calls StaticClearRandom).
 	if (globalsSize > 0)
 	{
-		FRandom::StaticReadRNGBinary(xfer.data.Data(), globalsSize);
+		// The shared globals blob carries all session-level state that must
+		// match the host after G_InitNew() resets local runtime state.
+		G_SerializeMidgameGlobalsPostInit(globalsArc);
+		globalsArc.Close();
 	}
 
 	// Synchronize network state with the host.
@@ -2335,38 +2423,18 @@ void G_DoLoadGame ()
 	}
 
 
-	// Read intermission data for hubs
-	G_SerializeHub(arc);
-
 	primaryLevel->BotInfo.RemoveAllBots(primaryLevel, true);
 
 	savegamerestore = true;		// Use the player actors in the savegame
 
-	FString cvar;
-	arc("importantcvars", cvar);
-	if (!cvar.IsEmpty())
-	{
-		auto vars_p = cvar.GetTArrayView();
-		C_ReadCVars(vars_p);
-	}
-	else
-	{
-		C_SerializeCVars(arc, "servercvars", CVAR_SERVERINFO);
-	}
-
 	uint32_t time[2] = { 1,0 };
-
+	G_SerializeMidgameGlobalsPreInit(arc);
 	arc("ticrate", time[0])
-		("leveltime", time[1])
-		("globalfreeze", globalfreeze)
-		("startpos", startpos)
-		("laststartpos", laststartpos);
-	// dearchive all the modifications
+		("leveltime", time[1]);
 	level.time = Scale(time[1], TICRATE, time[0]);
 
 	G_ReadSnapshots(resfile.get());
 	resfile.reset(nullptr);	// we no longer need the resource file below this point
-	G_ReadVisited(arc);
 
 	// load a base level
 	bool demoplaybacksave = demoplayback;
@@ -2376,12 +2444,7 @@ void G_DoLoadGame ()
 	savegamerestore = false;
 
 	STAT_Serialize(arc);
-	FRandom::StaticReadRNGState(arc);
-	P_ReadACSDefereds(arc);
-	P_ReadACSVars(arc);
-
-	NextSkill = -1;
-	arc("nextskill", NextSkill);
+	G_SerializeMidgameGlobalsPostInit(arc);
 	Net_SetWaiting();
 
 	if (level.info != nullptr)
@@ -2672,9 +2735,7 @@ void G_DoSaveGame (bool okForQuicksave, bool forceQuicksave, FString filename, c
 	PutSaveWads (savegameinfo);
 	PutSaveComment (savegameinfo);
 
-	// Intermission stats for hubs
-	G_SerializeHub(savegameglobals);
-	C_SerializeCVars(savegameglobals, "servercvars", CVAR_SERVERINFO);
+	G_SerializeMidgameGlobalsPreInit(savegameglobals);
 
 	if (level.time != 0 || level.maptime != 0)
 	{
@@ -2683,21 +2744,8 @@ void G_DoSaveGame (bool okForQuicksave, bool forceQuicksave, FString filename, c
 		savegameglobals("leveltime", level.time);
 	}
 
-	savegameglobals("globalfreeze", globalfreeze)
-					("startpos", startpos)
-					("laststartpos", laststartpos);
-
 	STAT_Serialize(savegameglobals);
-	FRandom::StaticWriteRNGState(savegameglobals);
-	P_WriteACSDefereds(savegameglobals);
-	P_WriteACSVars(savegameglobals);
-	G_WriteVisited(savegameglobals);
-
-
-	if (NextSkill != -1)
-	{
-		savegameglobals("nextskill", NextSkill);
-	}
+	G_SerializeMidgameGlobalsPostInit(savegameglobals);
 
 	auto picdata = savepic.GetBuffer();
 	FCompressedBuffer bufpng = { picdata->size(), picdata->size(), FileSys::METHOD_STORED, static_cast<unsigned int>(crc32(0, &(*picdata)[0], picdata->size())), (char*)&(*picdata)[0] };

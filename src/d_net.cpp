@@ -57,6 +57,7 @@
 #include "savegamemanager.h"
 #include "sbar.h"
 #include "screenjob.h"
+#include "serializer.h"
 #include "version.h"
 #include "vm.h"
 
@@ -775,17 +776,6 @@ static void ClientConnecting(int client)
 	state.Flags = CF_JOINING | CF_AWAITING_STATE;
 	state.LastPacketReceivedTime = I_msTime();
 
-	// Notify all other clients that a new player is joining.
-	uint8_t buf[4];
-	buf[0] = NCMD_SETUP;
-	buf[1] = PRE_MIDGAME_PLAYER_JOIN;
-	buf[2] = static_cast<uint8_t>(client);
-	for (auto c : NetworkClients)
-	{
-		if (c != consoleplayer && c != client)
-			I_SendSetupPacket(c, buf, 3);
-	}
-
 	Printf("Client %d is joining mid-game\n", client);
 }
 
@@ -1108,8 +1098,25 @@ static FStateTransferSend PendingStateTransfer;
 FStateTransferRecv IncomingStateTransfer;
 static void AbortStateTransfer();
 static void BeginStateTransfer(int client);
+static bool IsMapLoaded();
 void Net_SetupUserInfo();
 static uint32_t StaticSumSeeds();
+
+static bool CanAcceptMidgameJoinNow()
+{
+	return gamestate == GS_LEVEL
+		&& IsMapLoaded()
+		&& gameaction == ga_nothing
+		&& LevelStartStatus == LST_READY
+		&& !bMigrating
+		&& !PendingStateTransfer.active;
+}
+
+static void RejectIncomingMidgameJoin(EMidgameRejectReason reason)
+{
+	uint8_t buf[3] = { NCMD_SETUP, PRE_MIDGAME_REJECT, static_cast<uint8_t>(reason) };
+	I_SendSetupPacketToAddress(buf, 3);
+}
 
 
 // Host receives: an unknown client wants to join mid-game.
@@ -1123,8 +1130,16 @@ void HandleMidgameConnect()
 	// lockstep desync issues with 3+ players.
 	if (!dedicatedServer && !net_allowjoin)
 	{
-		uint8_t buf[3] = { NCMD_SETUP, PRE_MIDGAME_REJECT, REJECT_DISABLED };
-		I_SendSetupPacketToAddress(buf, 3);
+		RejectIncomingMidgameJoin(REJECT_DISABLED);
+		return;
+	}
+
+	// Only allow late joins while the host is safely inside active level play.
+	// Everything else should be treated as a transient retry so we do not race
+	// level transitions or partially initialize a join that cannot complete.
+	if (!CanAcceptMidgameJoinNow())
+	{
+		RejectIncomingMidgameJoin(REJECT_IN_TRANSITION);
 		return;
 	}
 
@@ -1132,26 +1147,18 @@ void HandleMidgameConnect()
 	// transferring state or still initializing (V_Init2/shaders) before
 	// requesting state. Without this, multiple clients can be accepted and
 	// all but the first deadlock when their STATE_READY is silently dropped.
-	if (bMigrating || PendingStateTransfer.active)
-	{
-		uint8_t buf[3] = { NCMD_SETUP, PRE_MIDGAME_REJECT, REJECT_IN_TRANSITION };
-		I_SendSetupPacketToAddress(buf, 3);
-		return;
-	}
 	for (auto c : NetworkClients)
 	{
 		if (ClientStates[c].Flags & (CF_JOINING | CF_AWAITING_STATE))
 		{
-			uint8_t buf[3] = { NCMD_SETUP, PRE_MIDGAME_REJECT, REJECT_IN_TRANSITION };
-			I_SendSetupPacketToAddress(buf, 3);
+			RejectIncomingMidgameJoin(REJECT_IN_TRANSITION);
 			return;
 		}
 	}
-
+	
 	if (I_IsAddressBanned())
 	{
-		uint8_t buf[3] = { NCMD_SETUP, PRE_MIDGAME_REJECT, REJECT_BANNED };
-		I_SendSetupPacketToAddress(buf, 3);
+		RejectIncomingMidgameJoin(REJECT_BANNED);
 		return;
 	}
 
@@ -1168,8 +1175,7 @@ void HandleMidgameConnect()
 
 	if (freeSlot < 0)
 	{
-		uint8_t buf[3] = { NCMD_SETUP, PRE_MIDGAME_REJECT, REJECT_FULL };
-		I_SendSetupPacketToAddress(buf, 3);
+		RejectIncomingMidgameJoin(REJECT_FULL);
 		return;
 	}
 
@@ -1179,8 +1185,7 @@ void HandleMidgameConnect()
 	FVerificationError error = Net_VerifyEngine(engineInfo, passwordOffset);
 	if (error.Error != FVerificationError::VE_NONE)
 	{
-		uint8_t buf[3] = { NCMD_SETUP, PRE_MIDGAME_REJECT, REJECT_VERIFICATION };
-		I_SendSetupPacketToAddress(buf, 3);
+		RejectIncomingMidgameJoin(REJECT_VERIFICATION);
 		return;
 	}
 
@@ -1190,8 +1195,7 @@ void HandleMidgameConnect()
 		|| memchr(&NetBuffer[2u + passwordOffset], '\0', NetBufferLength - 2u - passwordOffset) == nullptr
 		|| strcmp(net_password, (const char*)&NetBuffer[2u + passwordOffset])))
 	{
-		uint8_t buf[3] = { NCMD_SETUP, PRE_MIDGAME_REJECT, REJECT_PASSWORD };
-		I_SendSetupPacketToAddress(buf, 3);
+		RejectIncomingMidgameJoin(REJECT_PASSWORD);
 		return;
 	}
 
@@ -1413,21 +1417,29 @@ static void BeginStateTransfer(int client)
 		return;
 	}
 
-	// Serialize the full RNG state. The joiner must have the exact same RNG
-	// state as the server at the snapshot gametic so tics between snapshot
-	// and DEM_MIDGAMESPAWN produce identical results on all nodes.
-	TArray<uint8_t> rngData;
-	FRandom::StaticWriteRNGBinary(rngData);
+	FSerializer globals;
+	if (!globals.OpenWriter(false))
+	{
+		Printf("BeginStateTransfer: failed to serialize globals\n");
+		if (playeringame[consoleplayer] && !dedicatedServer)
+			P_PredictClient();
+		return;
+	}
+	G_SerializeMidgameGlobalsPreInit(globals);
+	G_SerializeMidgameGlobalsPostInit(globals);
+	unsigned globalsSize = 0;
+	const char* globalsData = globals.GetOutput(&globalsSize);
 
-	// Build transfer buffer: [globals (RNG state)] + [16-byte snapshot header] + [compressed snapshot]
+	// Build transfer buffer: [globals JSON blob] + [16-byte snapshot header] + [compressed snapshot]
 	const auto& snap = info->Snapshot;
 	const size_t snapshotHeaderSize = 16;
 	const size_t snapshotSize = snap.mCompressedSize;
-	xfer.globalsSize = rngData.Size();
+	xfer.globalsSize = globalsSize;
 	xfer.data.Resize(xfer.globalsSize + snapshotHeaderSize + snapshotSize);
 
-	// Copy globals (RNG state) first.
-	memcpy(xfer.data.Data(), rngData.Data(), xfer.globalsSize);
+	// Copy globals first.
+	if (xfer.globalsSize > 0)
+		memcpy(xfer.data.Data(), globalsData, xfer.globalsSize);
 
 	// Then the snapshot header + data.
 	uint8_t* hdr = xfer.data.Data() + xfer.globalsSize;
@@ -1742,8 +1754,14 @@ void HandleMidgameStateReady()
 		|| !(ClientStates[joinerSlot].Flags & CF_AWAITING_STATE))
 		return;
 
-	if (PendingStateTransfer.active)
-		return; // Already transferring state to someone.
+	if (!CanAcceptMidgameJoinNow())
+	{
+		Printf("Client %d became ready while the host was transitioning, aborting join\n", joinerSlot);
+		SendSetupPacketToClient(joinerSlot, PRE_MIDGAME_STATE_ERROR);
+		ClientStates[joinerSlot].Flags &= ~(CF_JOINING | CF_AWAITING_STATE);
+		DisconnectClient(joinerSlot);
+		return;
+	}
 
 	if (NetBufferLength > 2)
 	{
