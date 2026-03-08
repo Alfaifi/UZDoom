@@ -6482,7 +6482,7 @@ AActor *FLevelLocals::SpawnPlayer (FPlayerStart *mthing, int playernum, int flag
 
 	// Dedicated server ghost player (slot 0): make invisible and non-interactive
 	// so it doesn't block real players or appear as a visible model.
-	if ((dedicatedServer || hostIsDedicated) && playernum == 0)
+	if (Net_IsGhostPlayer(playernum))
 	{
 		mobj->renderflags |= RF_INVISIBLE;
 		mobj->flags &= ~(MF_SOLID | MF_SHOOTABLE);

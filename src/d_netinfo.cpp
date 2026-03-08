@@ -809,6 +809,7 @@ void D_ReadUserInfoStrings (int pnum, TArrayView<uint8_t>& stream, bool update)
 	bool compact;
 	FName keyname = NAME_None;
 	unsigned int infotype = 0;
+	int skinPlayerClass = players[pnum].CurrentPlayerClass;
 
 	if (*ptr++ != '\\')
 		return;
@@ -865,64 +866,68 @@ void D_ReadUserInfoStrings (int pnum, TArrayView<uint8_t>& stream, bool update)
 				keyname = FName(ptr, valstart - ptr - 1, true);
 			}
 			
-			// A few of these need special handling.
-			switch (keyname.GetIndex())
-			{
-			case NAME_Gender:
-				info->GenderChanged(value.GetChars());
-				break;
-
-			case NAME_PlayerClass:
-				info->PlayerClassChanged(value.GetChars());
-				break;
-
-			case NAME_Skin:
-				info->SkinChanged(value.GetChars(), players[pnum].CurrentPlayerClass);
-				if (players[pnum].mo != NULL)
+				// A few of these need special handling.
+				switch (keyname.GetIndex())
 				{
-					if (players[pnum].cls != NULL &&
-						!(players[pnum].mo->flags4 & MF4_NOSKIN) &&
-						players[pnum].mo->state->sprite ==
-						GetDefaultByType (players[pnum].cls)->SpawnState->sprite)
-					{ // Only change the sprite if the player is using a standard one
-						players[pnum].mo->sprite = Skins[info->GetSkin()].sprite;
-					}
-				}
-				// Rebuild translation in case the new skin uses a different range
-				// than the old one.
-				R_BuildPlayerTranslation(pnum);
-				break;
+				case NAME_Gender:
+					info->GenderChanged(value.GetChars());
+					break;
 
-			case NAME_Team:
-				UpdateTeam(pnum, atoi(value.GetChars()), update);
-				break;
-
-			case NAME_Color:
-				info->ColorChanged(value.GetChars());
-				break;
-
-			default:
-				cvar_ptr = info->CheckKey(keyname);
-				if (cvar_ptr != NULL)
+				case NAME_PlayerClass:
 				{
-					assert(*cvar_ptr != NULL);
-					UCVarValue val;
-					FString oldname;
-
-					if (keyname == NAME_Name)
-					{
-						val = (*cvar_ptr)->GetGenericRep(CVAR_String);
-						oldname = val.String;
-					}
-					val.String = CleanseString(value.LockBuffer());
-					(*cvar_ptr)->SetGenericRep(val, CVAR_String);
-					value.UnlockBuffer();
-					if (keyname == NAME_Name && update && oldname.Compare (value))
-					{
-						Printf("%s is now known as %s\n", oldname.GetChars(), value.GetChars());
-					}
+					const int classnum = info->PlayerClassChanged(value.GetChars());
+					if (classnum >= 0 && classnum < (int)PlayerClasses.Size())
+						skinPlayerClass = classnum;
+					break;
 				}
-				break;
+
+				case NAME_Skin:
+					info->SkinChanged(value.GetChars(), skinPlayerClass);
+					if (players[pnum].mo != NULL)
+					{
+						if (players[pnum].cls != NULL &&
+							!(players[pnum].mo->flags4 & MF4_NOSKIN) &&
+							players[pnum].mo->state->sprite ==
+							GetDefaultByType (players[pnum].cls)->SpawnState->sprite)
+						{ // Only change the sprite if the player is using a standard one
+							players[pnum].mo->sprite = Skins[info->GetSkin()].sprite;
+						}
+					}
+					// Rebuild translation in case the new skin uses a different range
+					// than the old one.
+					R_BuildPlayerTranslation(pnum);
+					break;
+
+				case NAME_Team:
+					UpdateTeam(pnum, atoi(value.GetChars()), update);
+					break;
+
+				case NAME_Color:
+					info->ColorChanged(value.GetChars());
+					break;
+
+				default:
+					cvar_ptr = info->CheckKey(keyname);
+					if (cvar_ptr != NULL)
+					{
+						assert(*cvar_ptr != NULL);
+						UCVarValue val;
+						FString oldname;
+
+						if (keyname == NAME_Name)
+						{
+							val = (*cvar_ptr)->GetGenericRep(CVAR_String);
+							oldname = val.String;
+						}
+						val.String = CleanseString(value.LockBuffer());
+						(*cvar_ptr)->SetGenericRep(val, CVAR_String);
+						value.UnlockBuffer();
+						if (keyname == NAME_Name && update && oldname.Compare (value))
+						{
+							Printf("%s is now known as %s\n", oldname.GetChars(), value.GetChars());
+						}
+					}
+					break;
 			}
 			if (keyname == NAME_Color || keyname == NAME_ColorSet)
 			{

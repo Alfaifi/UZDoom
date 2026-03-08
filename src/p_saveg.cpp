@@ -828,9 +828,11 @@ void FLevelLocals::CopyPlayer(player_t *dst, player_t *src, const char *name)
 	uibackup.TransferFrom(dst->userinfo);
 	uibackup2.TransferFrom(src->userinfo);
 
-	int chasecam = dst->cheats & CF_CHASECAM;	// Remember the chasecam setting
-	bool attackdown = dst->attackdown;
-	bool usedown = dst->usedown;
+	const bool loadingMidgameJoinSnapshot = savegamerestore && netgame && !PlayerInGame(consoleplayer);
+	const bool preserveLocalInputState = !loadingMidgameJoinSnapshot || dst == &players[consoleplayer];
+	int chasecam = preserveLocalInputState ? (dst->cheats & CF_CHASECAM) : 0;	// Remember the chasecam setting
+	bool attackdown = preserveLocalInputState ? dst->attackdown : src->attackdown;
+	bool usedown = preserveLocalInputState ? dst->usedown : src->usedown;
 
 	dst->CopyFrom(*src);	// To avoid memory leaks at this point the userinfo in src must be empty which is taken care of by the TransferFrom call above.
 
@@ -852,7 +854,9 @@ void FLevelLocals::CopyPlayer(player_t *dst, player_t *src, const char *name)
 	}
 	else
 	{
-		dst->userinfo.TransferFrom(uibackup);
+		// Mid-game join snapshots must restore remote players' userinfo from the
+		// snapshot, not from the late joiner's pre-load placeholders/defaults.
+		dst->userinfo.TransferFrom(loadingMidgameJoinSnapshot ? uibackup2 : uibackup);
 		// The player class must come from the save, so that the menu reflects the currently playing one.
 		dst->userinfo.PlayerClassChanged(src->mo->GetInfo()->DisplayName.GetChars());
 	}
@@ -875,7 +879,7 @@ void FLevelLocals::CopyPlayer(player_t *dst, player_t *src, const char *name)
 		pspr = pspr->Next;
 	}
 
-	// These 2 variables may not be overwritten.
+	// Preserve local edge-triggered input state only for the active local player.
 	dst->attackdown = attackdown;
 	dst->usedown = usedown;
 }
@@ -1153,4 +1157,3 @@ void FLevelLocals::UnSnapshotLevel(bool hubLoad)
 		Behaviors.UnlockLevelVarStrings(levelnum);
 	}
 }
-

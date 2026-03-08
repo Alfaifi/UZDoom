@@ -1999,6 +1999,86 @@ void C_SerializeCVars(FSerializer& arc, const char* label, uint32_t filter)
 	}
 }
 
+static void SerializeRestorableServerCVars(FSerializer& arc)
+{
+	if (arc.isReading())
+	{
+		FString cvar;
+		arc("importantcvars", cvar);
+		if (!cvar.IsEmpty())
+		{
+			auto vars_p = cvar.GetTArrayView();
+			C_ReadCVars(vars_p);
+		}
+		else
+		{
+			C_SerializeCVars(arc, "servercvars", CVAR_SERVERINFO);
+		}
+	}
+	else
+	{
+		C_SerializeCVars(arc, "servercvars", CVAR_SERVERINFO);
+	}
+}
+
+void G_SerializeMidgameGlobalsPreInit(FSerializer& arc)
+{
+	G_SerializeHub(arc);
+	SerializeRestorableServerCVars(arc);
+
+	arc("globalfreeze", globalfreeze)
+		("startpos", startpos)
+		("laststartpos", laststartpos);
+
+	if (arc.isWriting())
+		G_WriteVisited(arc);
+	else
+		G_ReadVisited(arc);
+}
+
+void G_SerializeMidgameGlobalsPostInit(FSerializer& arc)
+{
+	if (arc.isWriting())
+	{
+		FRandom::StaticWriteRNGState(arc);
+		P_WriteACSDefereds(arc);
+		P_WriteACSVars(arc);
+		if (NextSkill != -1)
+			arc("nextskill", NextSkill);
+	}
+	else
+	{
+		FRandom::StaticReadRNGState(arc);
+		P_ReadACSDefereds(arc);
+		P_ReadACSVars(arc);
+
+		NextSkill = -1;
+		arc("nextskill", NextSkill);
+	}
+}
+
+void G_ApplyRendererPitchLimitsToPlayer(int player)
+{
+	if (player < 0 || player >= (int)MAXPLAYERS)
+		return;
+
+	int uppitch, downpitch;
+	if (!V_IsHardwareRenderer())
+	{
+		int maxvp = min(56, (int)maxviewpitch);
+		int maxup = min(32, (int)maxviewpitch);
+		uppitch = cl_oldfreelooklimit ? maxup : maxvp;
+		downpitch = maxvp;
+	}
+	else
+	{
+		uppitch = downpitch = (int)maxviewpitch;
+	}
+
+	players[player].MinPitch = DAngle::fromDeg(-(double)uppitch);
+	players[player].MaxPitch = DAngle::fromDeg((double)downpitch);
+}
+
 
 void SetupLoadingCVars();
 void FinishLoadingCVars();
@@ -2015,12 +2095,66 @@ bool CheckGZDoomSaveCompat(FString &engine, FString &software);
 
 static bool bMidgameStateRequested = false;
 static uint64_t midgameJoinStartTime = 0;
+static bool bMidgameJoinRenderReady = false;
+static constexpr int MaxPlayersInt = (int)MAXPLAYERS;
+
+static AActor* PickMidgameJoinRenderCamera()
+{
+	if (consoleplayer >= 0 && consoleplayer < MaxPlayersInt && players[consoleplayer].mo != nullptr)
+		return players[consoleplayer].mo;
+
+	AActor* ghostFallback = nullptr;
+
+	for (int i = 0; i < MaxPlayersInt; ++i)
+	{
+		if (!playeringame[i])
+			continue;
+
+		if (Net_IsGhostPlayer(i))
+		{
+			if (ghostFallback == nullptr)
+				ghostFallback = players[i].mo != nullptr ? players[i].mo : players[i].camera;
+			continue;
+		}
+
+		if (players[i].mo != nullptr)
+			return players[i].mo;
+		if (players[i].camera != nullptr)
+			return players[i].camera;
+	}
+
+	return ghostFallback;
+}
+
+bool G_CanRenderMidgameJoinView()
+{
+	return gamestate == GS_LEVEL
+		&& consoleplayer >= 0
+		&& consoleplayer < MaxPlayersInt
+		&& !playeringame[consoleplayer]
+		&& bMidgameJoinRenderReady
+		&& players[consoleplayer].camera != nullptr;
+}
+
+void G_ClearMidgameJoinRenderState()
+{
+	bMidgameJoinRenderReady = false;
+
+	if (consoleplayer < 0 || consoleplayer >= MaxPlayersInt)
+		return;
+
+	if (playeringame[consoleplayer] && players[consoleplayer].mo != nullptr)
+		players[consoleplayer].camera = players[consoleplayer].mo;
+	else
+		players[consoleplayer].camera = nullptr;
+}
 
 void G_AbortMidgameJoin()
 {
 	gameaction = ga_fullconsole;
 	bMidgameStateRequested = false;
 	midgameJoinStartTime = 0;
+	G_ClearMidgameJoinRenderState();
 	IncomingStateTransfer.Clear();
 }
 
@@ -2045,8 +2179,26 @@ void G_DoMidgameJoin()
 		if (!bMidgameStateRequested)
 		{
 			Printf("Requesting game state from host...\n");
-			uint8_t buf[2] = { NCMD_SETUP, PRE_MIDGAME_STATE_READY };
-			I_SendSetupPacket(Net_Arbitrator, buf, 2);
+			uint8_t buf[MAX_MSGLEN];
+			size_t pos = 0;
+			buf[pos++] = NCMD_SETUP;
+			buf[pos++] = PRE_MIDGAME_STATE_READY;
+
+			// Send our initial userinfo so the host can propagate the
+			// late joiner's name, skin, and colors before DEM_MIDGAMESPAWN.
+			const FString userinfo = D_GetUserInfoStrings(consoleplayer, true);
+			const size_t userinfoSize = userinfo.Len() + 1;
+			if (pos + userinfoSize > MAX_MSGLEN)
+			{
+				Printf("G_DoMidgameJoin: userinfo too large (%zu bytes)\n", userinfoSize);
+				G_AbortMidgameJoin();
+				return;
+			}
+
+			memcpy(&buf[pos], userinfo.GetChars(), userinfoSize);
+			pos += userinfoSize;
+
+			I_SendSetupPacket(Net_Arbitrator, buf, pos);
 			bMidgameStateRequested = true;
 			midgameJoinStartTime = I_msTime();
 		}
@@ -2075,8 +2227,7 @@ void G_DoMidgameJoin()
 		return;
 	}
 
-	// Transfer data format: [globals (RNG state)] [snapshot header (16)] [compressed snapshot]
-	// The globals portion contains binary-serialized RNG state from the server.
+	// Transfer data format: [globals JSON blob] [snapshot header (16)] [compressed snapshot]
 	const size_t globalsSize = xfer.globalsSize;
 	const size_t totalSize = xfer.data.Size();
 	const size_t snapshotHeaderSize = 16;
@@ -2111,54 +2262,81 @@ void G_DoMidgameJoin()
 	info->Snapshot.mBuffer = new char[info->Snapshot.mCompressedSize];
 	memcpy(info->Snapshot.mBuffer, snapshotStart + snapshotHeaderSize, info->Snapshot.mCompressedSize);
 
+	FSerializer globalsArc;
+	if (globalsSize > 0 && !globalsArc.OpenReader(reinterpret_cast<const char*>(xfer.data.Data()), globalsSize))
+	{
+		Printf("G_DoMidgameJoin: failed to open globals blob (%zu bytes)\n", globalsSize);
+		info->Snapshot.Clean();
+		xfer.Clear();
+		return;
+	}
+
+	if (globalsSize > 0)
+		G_SerializeMidgameGlobalsPreInit(globalsArc);
+
 	// The joiner is NOT in the game yet — their slot will be activated via
 	// DEM_MIDGAMESPAWN after we signal STATE_LOADED.
 	playeringame[consoleplayer] = false;
+	G_ClearMidgameJoinRenderState();
 
 	// Load the map with the snapshot. Setting savegamerestore triggers
 	// UnSnapshotLevel() inside G_InitNew(). Note: G_InitNew calls
-	// StaticClearRandom() which resets RNG — we restore it below.
+	// StaticClearRandom() which resets RNG; we restore it below.
 	savegamerestore = true;
 	G_InitNew(xfer.mapName.GetChars(), false);
 	savegamerestore = false;
+
+	// Automap discovery is local in normal multiplayer. A late joiner should
+	// start with no personal ML_MAPPED state instead of inheriting any host
+	// snapshot data, while ML_REVEALED and all-map effects remain intact.
+	for (auto& line : primaryLevel->lines)
+		line.flags &= ~ML_MAPPED;
+	for (auto& sub : primaryLevel->subsectors)
+		sub.flags &= ~SSECMF_DRAWN;
+
+	if (primaryLevel->automap != nullptr)
+	{
+		// The dedicated host serializes automap runtime state with no real
+		// display attached, so rebuild the automap from the local client's
+		// current resolution instead of trusting the snapshot values.
+		primaryLevel->automap->LevelInit();
+		primaryLevel->automap->ResetFollowLocation();
+		primaryLevel->automap->UpdateShowAllLines();
+	}
+
+	// Snapshot loading restores userinfo, but the palette translations still
+	// need to be rebuilt locally so existing players keep their skin colors.
+	for (size_t i = 0; i < MAXPLAYERS; ++i)
+	{
+		if (playeringame[i])
+			R_BuildPlayerTranslation((int)i);
+	}
 
 	// Fix pitch limits for all players. ReadOnePlayer sets MinPitch=MaxPitch=
 	// current pitch as a temporary measure (the real limits arrive via
 	// DEM_SETPITCHLIMIT from each player's console). For a mid-game joiner,
 	// remote players never re-send their pitch limits, so fix them now using
 	// the local renderer's pitch range.
+	for (size_t i = 0; i < MAXPLAYERS; ++i)
 	{
-		int uppitch, downpitch;
-		if (!V_IsHardwareRenderer())
-		{
-			int maxvp = min(56, (int)maxviewpitch);
-			int maxup = min(32, (int)maxviewpitch);
-			uppitch = cl_oldfreelooklimit ? maxup : maxvp;
-			downpitch = maxvp;
-		}
-		else
-		{
-			uppitch = downpitch = (int)maxviewpitch;
-		}
-		for (size_t i = 0; i < MAXPLAYERS; ++i)
-		{
-			if (playeringame[i] && players[i].mo)
-			{
-				players[i].MinPitch = DAngle::fromDeg(-(double)uppitch);
-				players[i].MaxPitch = DAngle::fromDeg((double)downpitch);
-			}
-		}
+		G_ApplyRendererPitchLimitsToPlayer((int)i);
 	}
 
-	// Restore the exact RNG state from the server at snapshot time.
-	// This must happen AFTER G_InitNew (which calls StaticClearRandom).
 	if (globalsSize > 0)
 	{
-		FRandom::StaticReadRNGBinary(xfer.data.Data(), globalsSize);
+		// The shared globals blob carries all session-level state that must
+		// match the host after G_InitNew() resets local runtime state.
+		G_SerializeMidgameGlobalsPostInit(globalsArc);
+		globalsArc.Close();
 	}
 
 	// Synchronize network state with the host.
 	Net_PrepareMidgameSync();
+
+	// The late joiner is still not gameplay-active, but the snapshot world is
+	// loaded and can be rendered locally while waiting for DEM_MIDGAMESPAWN.
+	players[consoleplayer].camera = PickMidgameJoinRenderCamera();
+	bMidgameJoinRenderReady = (players[consoleplayer].camera != nullptr);
 
 	// Signal to the host that we've loaded successfully.
 	xfer.loadedSent = true;
@@ -2309,38 +2487,18 @@ void G_DoLoadGame ()
 	}
 
 
-	// Read intermission data for hubs
-	G_SerializeHub(arc);
-
 	primaryLevel->BotInfo.RemoveAllBots(primaryLevel, true);
 
 	savegamerestore = true;		// Use the player actors in the savegame
 
-	FString cvar;
-	arc("importantcvars", cvar);
-	if (!cvar.IsEmpty())
-	{
-		auto vars_p = cvar.GetTArrayView();
-		C_ReadCVars(vars_p);
-	}
-	else
-	{
-		C_SerializeCVars(arc, "servercvars", CVAR_SERVERINFO);
-	}
-
 	uint32_t time[2] = { 1,0 };
-
+	G_SerializeMidgameGlobalsPreInit(arc);
 	arc("ticrate", time[0])
-		("leveltime", time[1])
-		("globalfreeze", globalfreeze)
-		("startpos", startpos)
-		("laststartpos", laststartpos);
-	// dearchive all the modifications
+		("leveltime", time[1]);
 	level.time = Scale(time[1], TICRATE, time[0]);
 
 	G_ReadSnapshots(resfile.get());
 	resfile.reset(nullptr);	// we no longer need the resource file below this point
-	G_ReadVisited(arc);
 
 	// load a base level
 	bool demoplaybacksave = demoplayback;
@@ -2350,12 +2508,7 @@ void G_DoLoadGame ()
 	savegamerestore = false;
 
 	STAT_Serialize(arc);
-	FRandom::StaticReadRNGState(arc);
-	P_ReadACSDefereds(arc);
-	P_ReadACSVars(arc);
-
-	NextSkill = -1;
-	arc("nextskill", NextSkill);
+	G_SerializeMidgameGlobalsPostInit(arc);
 	Net_SetWaiting();
 
 	if (level.info != nullptr)
@@ -2646,9 +2799,7 @@ void G_DoSaveGame (bool okForQuicksave, bool forceQuicksave, FString filename, c
 	PutSaveWads (savegameinfo);
 	PutSaveComment (savegameinfo);
 
-	// Intermission stats for hubs
-	G_SerializeHub(savegameglobals);
-	C_SerializeCVars(savegameglobals, "servercvars", CVAR_SERVERINFO);
+	G_SerializeMidgameGlobalsPreInit(savegameglobals);
 
 	if (level.time != 0 || level.maptime != 0)
 	{
@@ -2657,21 +2808,8 @@ void G_DoSaveGame (bool okForQuicksave, bool forceQuicksave, FString filename, c
 		savegameglobals("leveltime", level.time);
 	}
 
-	savegameglobals("globalfreeze", globalfreeze)
-					("startpos", startpos)
-					("laststartpos", laststartpos);
-
 	STAT_Serialize(savegameglobals);
-	FRandom::StaticWriteRNGState(savegameglobals);
-	P_WriteACSDefereds(savegameglobals);
-	P_WriteACSVars(savegameglobals);
-	G_WriteVisited(savegameglobals);
-
-
-	if (NextSkill != -1)
-	{
-		savegameglobals("nextskill", NextSkill);
-	}
+	G_SerializeMidgameGlobalsPostInit(savegameglobals);
 
 	auto picdata = savepic.GetBuffer();
 	FCompressedBuffer bufpng = { picdata->size(), picdata->size(), FileSys::METHOD_STORED, static_cast<unsigned int>(crc32(0, &(*picdata)[0], picdata->size())), (char*)&(*picdata)[0] };
