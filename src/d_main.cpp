@@ -1107,9 +1107,10 @@ void D_Display ()
 	if (nodrawers || screen == NULL)
 		return; 				// for comparative timing / profiling
 
-	// Mid-game joiner: don't render until DEM_MIDGAMESPAWN fires and spawns our actor.
-	if (consoleplayer < 0 || !playeringame[consoleplayer])
+	if (consoleplayer < 0)
 		return;
+
+	const bool canRenderLevelView = playeringame[consoleplayer] || G_CanRenderMidgameJoinView();
 
 	if (!AppActive && !setmodeneeded && !vid_activeinbackground)
 	{
@@ -1123,7 +1124,7 @@ void D_Display ()
 
 	r_renderercaps = GetCaps(); // [SP] Get the current capabilities of the renderer
 
-	if (players[consoleplayer].camera == NULL)
+	if (players[consoleplayer].camera == NULL && playeringame[consoleplayer])
 	{
 		players[consoleplayer].camera = players[consoleplayer].mo;
 	}
@@ -1214,55 +1215,63 @@ void D_Display ()
 		// [ZZ] execute event hook that we just started the frame
 		//E_RenderFrame();
 		//
-
-		D_Render([&]()
+		if (gamestate != GS_LEVEL || canRenderLevelView)
 		{
-			viewsec = RenderView(&players[consoleplayer]);
-		}, true);
+			D_Render([&]()
+			{
+				viewsec = RenderView(&players[consoleplayer]);
+			}, true);
+		}
 
 		twod->Begin(screen->GetWidth(), screen->GetHeight());
-		if (!hud_toggled)
+		if (gamestate != GS_LEVEL || canRenderLevelView)
 		{
-			V_DrawBlend(viewsec);
-			if (automapactive)
+			if (!hud_toggled)
 			{
-				primaryLevel->automap->Drawer ((hud_althud && viewheight == SCREENHEIGHT) ? viewheight : StatusBar->GetTopOfStatusbar());
-			}
-
-			// for timing the statusbar code.
-			//cycle_t stb;
-			//stb.Reset();
-			//stb.Clock();
-			if (!automapactive || viewactive)
-			{
-				StatusBar->RefreshViewBorder ();
-			}
-			if (hud_althud && viewheight == SCREENHEIGHT && screenblocks > 10)
-			{
-				StatusBar->DrawBottomStuff (HUD_AltHud);
-				if (DrawFSHUD || automapactive) StatusBar->DrawAltHUD();
-				if (players[consoleplayer].camera && players[consoleplayer].camera->player && !automapactive)
+				V_DrawBlend(viewsec);
+				if (automapactive)
 				{
-					StatusBar->DrawCrosshair(vp.TicFrac);
+					primaryLevel->automap->Drawer ((hud_althud && viewheight == SCREENHEIGHT) ? viewheight : StatusBar->GetTopOfStatusbar());
 				}
-				StatusBar->CallDraw (HUD_AltHud, vp.TicFrac);
-				StatusBar->DrawTopStuff (HUD_AltHud);
+
+				if (gamestate != GS_LEVEL || playeringame[consoleplayer])
+				{
+					// for timing the statusbar code.
+					//cycle_t stb;
+					//stb.Reset();
+					//stb.Clock();
+					if (!automapactive || viewactive)
+					{
+						StatusBar->RefreshViewBorder ();
+					}
+					if (hud_althud && viewheight == SCREENHEIGHT && screenblocks > 10)
+					{
+						StatusBar->DrawBottomStuff (HUD_AltHud);
+						if (DrawFSHUD || automapactive) StatusBar->DrawAltHUD();
+						if (players[consoleplayer].camera && players[consoleplayer].camera->player && !automapactive)
+						{
+							StatusBar->DrawCrosshair(vp.TicFrac);
+						}
+						StatusBar->CallDraw (HUD_AltHud, vp.TicFrac);
+						StatusBar->DrawTopStuff (HUD_AltHud);
+					}
+					else if (viewheight == SCREENHEIGHT && viewactive && screenblocks > 10)
+					{
+						EHudState state = DrawFSHUD ? HUD_Fullscreen : HUD_None;
+						StatusBar->DrawBottomStuff (state);
+						StatusBar->CallDraw (state, vp.TicFrac);
+						StatusBar->DrawTopStuff (state);
+					}
+					else
+					{
+						StatusBar->DrawBottomStuff (HUD_StatusBar);
+						StatusBar->CallDraw (HUD_StatusBar, vp.TicFrac);
+						StatusBar->DrawTopStuff (HUD_StatusBar);
+					}
+					//stb.Unclock();
+					//Printf("Stbar = %f\n", stb.TimeMS());
+				}
 			}
-			else if (viewheight == SCREENHEIGHT && viewactive && screenblocks > 10)
-			{
-				EHudState state = DrawFSHUD ? HUD_Fullscreen : HUD_None;
-				StatusBar->DrawBottomStuff (state);
-				StatusBar->CallDraw (state, vp.TicFrac);
-				StatusBar->DrawTopStuff (state);
-			}
-			else
-			{
-				StatusBar->DrawBottomStuff (HUD_StatusBar);
-				StatusBar->CallDraw (HUD_StatusBar, vp.TicFrac);
-				StatusBar->DrawTopStuff (HUD_StatusBar);
-			}
-			//stb.Unclock();
-			//Printf("Stbar = %f\n", stb.TimeMS());
 		}
 	}
 	else
@@ -2998,7 +3007,7 @@ static bool System_DispatchEvent(event_t* ev)
 {
 	shiftState.AddEvent(ev);
 
-	if (ev->type == EV_Mouse && gamestate == GS_LEVEL && menuactive == MENU_Off && ConsoleState != c_down && ConsoleState != c_falling && !primaryLevel->localEventManager->Responder(ev) && !paused)
+	if (ev->type == EV_Mouse && gamestate == GS_LEVEL && menuactive == MENU_Off && ConsoleState != c_down && ConsoleState != c_falling && !primaryLevel->localEventManager->Responder(ev) && !paused && !Net_ShouldSuppressMidgameJoinInput())
 	{
 		if (buttonMap.ButtonDown(Button_Mlook) || freelook)
 		{

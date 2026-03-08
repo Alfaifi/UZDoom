@@ -18,6 +18,7 @@
 */
 
 #include <stddef.h>
+#include <stdio.h>
 
 #define __STDC_FORMAT_MACROS
 #include <inttypes.h>
@@ -85,6 +86,7 @@ extern FString	savegamefile;
 extern bool AppActive;
 
 void P_ClearLevelInterpolation();
+static bool IsMapLoaded();
 
 // Big-endian read/write helpers for network packet serialization.
 static inline void WriteBE32(uint8_t* p, uint32_t v)
@@ -257,6 +259,69 @@ CUSTOM_CVAR(Int, cl_debugprediction, 0, CVAR_CHEAT)
 	else if (self > BACKUPTICS - 1)
 		self = BACKUPTICS - 1;
 }
+CVAR(Bool, net_dedicatedhibernate, true, CVAR_SERVERINFO | CVAR_NOSAVE)
+
+bool Net_IsGhostPlayer(int player)
+{
+	return (dedicatedServer || hostIsDedicated) && player == 0;
+}
+
+static bool IsDedicatedControlStream(int player)
+{
+	return Net_IsGhostPlayer(player);
+}
+
+static bool IsRealGameplayPlayer(int player)
+{
+	return player >= 0 && player < (int)MAXPLAYERS && playeringame[player] && !Net_IsGhostPlayer(player);
+}
+
+static int CountRealGameplayPlayers()
+{
+	int total = 0;
+	for (int i = 0; i < (int)MAXPLAYERS; ++i)
+	{
+		if (IsRealGameplayPlayer(i))
+			++total;
+	}
+
+	return total;
+}
+
+static int CountNonGhostNetworkClients(bool includeQuitters)
+{
+	int total = 0;
+	for (auto client : NetworkClients)
+	{
+		if (Net_IsGhostPlayer(client))
+			continue;
+		if (!includeQuitters && (ClientStates[client].Flags & CF_QUIT))
+			continue;
+		++total;
+	}
+
+	return total;
+}
+
+static bool HasNonGhostNetworkClient()
+{
+	return CountNonGhostNetworkClients(false) > 0;
+}
+
+static bool ShouldHibernateDedicatedServer()
+{
+	return dedicatedServer
+		&& net_dedicatedhibernate
+		&& !demoplayback
+		&& gamestate == GS_LEVEL
+		&& gameaction == ga_nothing
+		&& LevelStartStatus == LST_READY
+		&& IsMapLoaded()
+		&& !HasNonGhostNetworkClient()
+		&& CountRealGameplayPlayers() == 0;
+}
+
+static void ResetNetLagHistories();
 
 // Used to write out all network events that occured leading up to the next tick.
 static struct NetEventData
@@ -469,6 +534,7 @@ void Net_ClearBuffers()
 
 	FullLatencyCycle = MAXSENDTICS * 3;
 	LastLatencyUpdate = 0;
+	ResetNetLagHistories();
 
 	playeringame[0] = true;
 	NetworkClients += 0;
@@ -490,7 +556,7 @@ bool Net_IsPlayerReady(int player)
 	}
 
 	// Ghost player on dedicated servers is always ready (no human to press buttons).
-	if ((dedicatedServer || hostIsDedicated) && player == 0)
+	if (Net_IsGhostPlayer(player))
 		return true;
 
 	return players[player].Bot != nullptr || (CutsceneReady & ((uint64_t)1u << player));
@@ -535,17 +601,25 @@ bool Net_CheckCutsceneReady()
 
 	uint64_t mask = 0u;
 	int totalReady = 0;
+	int totalPlayers = 0;
 	// Bots will be automatically assumed to be ready, so we don't include them.
 	for (auto client : NetworkClients)
 	{
+		if (Net_IsGhostPlayer(client))
+			continue;
+
 		mask |= (uint64_t)1u << client;
 		totalReady += Net_IsPlayerReady(client);
+		++totalPlayers;
 	}
+
+	if (totalPlayers <= 0)
+		return false;
 
 	if ((CutsceneReady & mask) == mask)
 		return true;
 
-	if ((float)totalReady / NetworkClients.Size() < net_cutscenereadypercent)
+	if ((float)totalReady / totalPlayers < net_cutscenereadypercent)
 		return false;
 
 	if (CutsceneCountdown <= 0)
@@ -610,7 +684,7 @@ void Net_ResetCommands(bool midTic)
 	for (auto client : NetworkClients)
 	{
 		auto& state = ClientStates[client];
-		state.Flags &= (CF_QUIT | CF_JOINING | CF_AWAITING_STATE);
+		state.Flags &= (CF_QUIT | CF_JOINING | CF_AWAITING_STATE | CF_AWAITING_ACTIVE);
 		state.StabilityBuffer = 0u;
 		state.CurrentSequence = min<int>(state.CurrentSequence, tic);
 		state.SequenceAck = min<int>(state.SequenceAck, tic);
@@ -768,11 +842,13 @@ static void ClientConnecting(int client)
 	// Initialize network state for the joining client.
 	auto& state = ClientStates[client];
 	memset(&state, 0, sizeof(FClientNetState));
-	state.CurrentSequence = gametic / TicDup;
-	state.SequenceAck = gametic / TicDup;
-	state.CurrentNetConsistency = CurrentConsistency;
-	state.ConsistencyAck = CurrentConsistency;
-	state.LastVerifiedConsistency = CurrentConsistency;
+	const int lastSeq = max(gametic / TicDup - 1, -1);
+	const int lastCon = max(CurrentConsistency - 1, -1);
+	state.CurrentSequence = lastSeq;
+	state.SequenceAck = lastSeq;
+	state.CurrentNetConsistency = lastCon;
+	state.ConsistencyAck = lastCon;
+	state.LastVerifiedConsistency = lastCon;
 	state.Flags = CF_JOINING | CF_AWAITING_STATE;
 	state.LastPacketReceivedTime = I_msTime();
 
@@ -1098,6 +1174,311 @@ static FStateTransferSend PendingStateTransfer;
 FStateTransferRecv IncomingStateTransfer;
 static void AbortStateTransfer();
 static void BeginStateTransfer(int client);
+static int16_t CalculateConsistency(int client, uint32_t seed);
+static void ResetNetLagHistories();
+static int16_t CalculatePendingJoinConsistency(int client, uint32_t seed);
+
+static bool IsWaitingForMidgameSpawn()
+{
+	return consoleplayer >= 0
+		&& consoleplayer != Net_Arbitrator
+		&& !playeringame[consoleplayer]
+		&& IncomingStateTransfer.loadedSent
+		&& !IncomingStateTransfer.activeSent;
+}
+
+static bool IsAwaitingMidgameActivation()
+{
+	return consoleplayer >= 0
+		&& consoleplayer != Net_Arbitrator
+		&& !playeringame[consoleplayer]
+		&& IncomingStateTransfer.activeSent;
+}
+
+constexpr int NETLAG_HISTORY_SAMPLES = 350;
+
+struct FNetLagHistory
+{
+	int Values[NETLAG_HISTORY_SAMPLES] = {};
+	int Index = 0;
+	int Count = 0;
+	int Sum = 0;
+	int Max = 0;
+
+	void Reset()
+	{
+		memset(Values, 0, sizeof(Values));
+		Index = Count = Sum = Max = 0;
+	}
+
+	void Push(int value)
+	{
+		value = max(value, 0);
+		if (Count < NETLAG_HISTORY_SAMPLES)
+		{
+			Values[Index] = value;
+			Sum += value;
+			Max = max(Max, value);
+			Index = (Index + 1) % NETLAG_HISTORY_SAMPLES;
+			++Count;
+			return;
+		}
+
+		const int old = Values[Index];
+		Values[Index] = value;
+		Sum += value - old;
+		Index = (Index + 1) % NETLAG_HISTORY_SAMPLES;
+
+		if (value >= Max)
+		{
+			Max = value;
+		}
+		else if (old == Max)
+		{
+			Max = 0;
+			for (int i = 0; i < Count; ++i)
+				Max = max(Max, Values[i]);
+		}
+	}
+
+	int Current() const
+	{
+		if (Count <= 0)
+			return 0;
+		const int cur = (Index + NETLAG_HISTORY_SAMPLES - 1) % NETLAG_HISTORY_SAMPLES;
+		return Values[cur];
+	}
+
+	int Average() const
+	{
+		return Count > 0 ? (Sum + Count / 2) / Count : 0;
+	}
+};
+
+static FNetLagHistory LocalInputLagHistory = {};
+static FNetLagHistory StreamBehindHistory[MAXPLAYERS] = {};
+static int LastLagHistorySample = INT_MIN;
+static int LastLagDumpSecond = INT_MIN;
+
+CVAR(Bool, net_lagdump, false, CVAR_NOSAVE)
+
+static void ResetNetLagDumpFile();
+static void DumpNetLagHistoriesIfNeeded();
+
+static int SeqTicsToMs(int tics)
+{
+	return min<int>(xs_RoundToInt(tics * TicDup * 1000.0 / TICRATE), 9999);
+}
+
+static FString GetNetLagDumpPath()
+{
+	if (consoleplayer == Net_Arbitrator)
+		return "/tmp/uzdoom-netlag-host.log";
+	if (consoleplayer >= 0 && consoleplayer < (int)MAXPLAYERS)
+		return FStringf("/tmp/uzdoom-netlag-client%d.log", consoleplayer + 1);
+	return "/tmp/uzdoom-netlag-client-unknown.log";
+}
+
+static bool IsTrackableClientForLagStats(int client)
+{
+	if (client < 0 || client >= (int)MAXPLAYERS || !NetworkClients.InGame(client))
+		return false;
+	if (ClientStates[client].Flags & (CF_JOINING | CF_AWAITING_STATE | CF_QUIT))
+		return false;
+	return true;
+}
+
+static int GetDisplayedClientSequenceForLagStats(int client, int newestSequence)
+{
+	int seq = ClientStates[client].CurrentSequence;
+	if (consoleplayer != Net_Arbitrator && client == consoleplayer)
+		seq = max(seq, newestSequence - 1);
+	return seq;
+}
+
+static void ResetNetLagHistories()
+{
+	LocalInputLagHistory.Reset();
+	for (auto& history : StreamBehindHistory)
+		history.Reset();
+	LastLagHistorySample = INT_MIN;
+	LastLagDumpSecond = INT_MIN;
+	if (net_lagdump)
+		ResetNetLagDumpFile();
+}
+
+static void ResetNetLagDumpFile()
+{
+	const FString path = GetNetLagDumpPath();
+	if (FILE* file = fopen(path.GetChars(), "w"))
+	{
+		fprintf(file, "# UZDoom network lag dump\n");
+		fclose(file);
+	}
+}
+
+static void SampleNetLagHistories()
+{
+	if (!netgame || demoplayback || LevelStartStatus != LST_READY)
+		return;
+
+	const int sampleSeq = gametic / TicDup;
+	if (sampleSeq == LastLagHistorySample)
+		return;
+	LastLagHistorySample = sampleSeq;
+
+	LocalInputLagHistory.Push(max<int>((ClientTic - gametic) / TicDup, 0));
+
+	const int newestSequence = ClientTic / TicDup;
+	for (int client = 0; client < (int)MAXPLAYERS; ++client)
+	{
+		if (!IsTrackableClientForLagStats(client))
+		{
+			if (!NetworkClients.InGame(client))
+				StreamBehindHistory[client].Reset();
+			continue;
+		}
+
+		const int seq = GetDisplayedClientSequenceForLagStats(client, newestSequence);
+		StreamBehindHistory[client].Push(max(newestSequence - seq, 0));
+	}
+
+	DumpNetLagHistoriesIfNeeded();
+}
+
+static void DumpNetLagHistoriesIfNeeded()
+{
+	if (!net_lagdump || !netgame || demoplayback || LevelStartStatus != LST_READY)
+		return;
+
+	const int dumpSecond = gametic / TICRATE;
+	if (dumpSecond == LastLagDumpSecond)
+		return;
+	LastLagDumpSecond = dumpSecond;
+
+	const FString path = GetNetLagDumpPath();
+	FILE* file = fopen(path.GetChars(), "a");
+	if (file == nullptr)
+		return;
+
+	const int newestSeq = ClientTic / TicDup;
+	int lowestSeq = newestSeq;
+	for (auto client : NetworkClients)
+	{
+		if (client == consoleplayer || !IsTrackableClientForLagStats(client))
+			continue;
+		lowestSeq = min(lowestSeq, GetDisplayedClientSequenceForLagStats(client, newestSeq));
+	}
+
+	fprintf(file,
+		"g=%d seq=%d con=%d local_now=%d local_avg=%d local_max=%d local_ms=%d/%d/%d buffer=%d buffer_ms=%d\n",
+		gametic,
+		newestSeq,
+		CurrentConsistency,
+		LocalInputLagHistory.Current(),
+		LocalInputLagHistory.Average(),
+		LocalInputLagHistory.Max,
+		SeqTicsToMs(LocalInputLagHistory.Current()),
+		SeqTicsToMs(LocalInputLagHistory.Average()),
+		SeqTicsToMs(LocalInputLagHistory.Max),
+		max(StabilityBuffer, 0),
+		SeqTicsToMs(max(StabilityBuffer, 0)));
+
+	for (auto client : NetworkClients)
+	{
+		if (client == consoleplayer)
+			continue;
+
+		const bool tracked = IsTrackableClientForLagStats(client);
+		const int seq = tracked ? GetDisplayedClientSequenceForLagStats(client, newestSeq) : ClientStates[client].CurrentSequence;
+		fprintf(file,
+			"  p%d%s seq=%d ack=%d con=%d behind_now=%d behind_avg=%d behind_max=%d behind_ms=%d/%d/%d latency=%u flags=0x%x\n",
+			client + 1,
+			(tracked && seq == lowestSeq) ? " gate" : "",
+			seq,
+			ClientStates[client].SequenceAck,
+			ClientStates[client].CurrentNetConsistency,
+			tracked ? StreamBehindHistory[client].Current() : 0,
+			tracked ? StreamBehindHistory[client].Average() : 0,
+			tracked ? StreamBehindHistory[client].Max : 0,
+			tracked ? SeqTicsToMs(StreamBehindHistory[client].Current()) : 0,
+			tracked ? SeqTicsToMs(StreamBehindHistory[client].Average()) : 0,
+			tracked ? SeqTicsToMs(StreamBehindHistory[client].Max) : 0,
+			ClientStates[client].AverageLatency,
+			ClientStates[client].Flags);
+	}
+
+	fflush(file);
+	fclose(file);
+}
+
+static int16_t CalculatePendingJoinConsistency(int client, uint32_t seed)
+{
+	uint32_t value = seed ^ (0x45d9f3bu * static_cast<uint32_t>(client + 1));
+	value ^= (value >> 16);
+	int16_t consistency = static_cast<int16_t>(value & 0x7fff);
+	return consistency != 0 ? consistency : 1;
+}
+
+static bool ShouldSuppressMidgameJoinLocalCommands()
+{
+	return consoleplayer >= 0
+		&& consoleplayer != Net_Arbitrator
+		&& (IsWaitingForMidgameSpawn() || IsAwaitingMidgameActivation());
+}
+
+bool Net_ShouldSuppressMidgameJoinInput()
+{
+	return ShouldSuppressMidgameJoinLocalCommands();
+}
+
+static void SendMidgameStateActive()
+{
+	if (consoleplayer < 0 || consoleplayer == Net_Arbitrator)
+		return;
+
+	const auto& player = players[consoleplayer];
+	const uint8_t upPitch = static_cast<uint8_t>(clamp<int>(xs_RoundToInt(-player.MinPitch.Degrees()), 0, 127));
+	const uint8_t downPitch = static_cast<uint8_t>(clamp<int>(xs_RoundToInt(player.MaxPitch.Degrees()), 0, 127));
+	uint8_t buf[4] = { NCMD_SETUP, PRE_MIDGAME_STATE_ACTIVE, upPitch, downPitch };
+	I_SendSetupPacket(Net_Arbitrator, buf, 4);
+}
+
+static void ResendMidgameStateActiveIfNeeded()
+{
+	if (!IncomingStateTransfer.activeSent)
+		return;
+
+	SendMidgameStateActive();
+}
+
+static void ConfirmMidgameJoinActive(int joinerSlot)
+{
+	if (consoleplayer != Net_Arbitrator)
+		return;
+	if (joinerSlot < 0 || joinerSlot >= (int)MAXPLAYERS)
+		return;
+	if (!(ClientStates[joinerSlot].Flags & CF_JOINING)
+		|| !(ClientStates[joinerSlot].Flags & CF_AWAITING_ACTIVE))
+		return;
+
+	const int lastSeq = max(gametic / TicDup - 1, ClientStates[joinerSlot].CurrentSequence);
+	const int lastCon = max(CurrentConsistency - 1, ClientStates[joinerSlot].CurrentNetConsistency);
+	ClientStates[joinerSlot].CurrentSequence = lastSeq;
+	ClientStates[joinerSlot].SequenceAck = lastSeq;
+	ClientStates[joinerSlot].CurrentNetConsistency = lastCon;
+	ClientStates[joinerSlot].ConsistencyAck = lastCon;
+	ClientStates[joinerSlot].LastVerifiedConsistency = lastCon;
+	ClientStates[joinerSlot].Flags &= ~CF_AWAITING_ACTIVE;
+
+	const uint8_t upPitch = static_cast<uint8_t>(clamp<int>(xs_RoundToInt(-players[joinerSlot].MinPitch.Degrees()), 0, 127));
+	const uint8_t downPitch = static_cast<uint8_t>(clamp<int>(xs_RoundToInt(players[joinerSlot].MaxPitch.Degrees()), 0, 127));
+	Net_WriteInt8(DEM_MIDGAMEACTIVE);
+	Net_WriteInt8(static_cast<uint8_t>(joinerSlot));
+	Net_WriteInt8(upPitch);
+	Net_WriteInt8(downPitch);
+}
+
 static bool IsMapLoaded();
 void Net_SetupUserInfo();
 static uint32_t StaticSumSeeds();
@@ -1364,11 +1745,13 @@ void HandleMidgamePlayerJoin()
 	// Initialize client state for the new player.
 	auto& state = ClientStates[newPlayer];
 	memset(&state, 0, sizeof(FClientNetState));
-	state.CurrentSequence = gametic / TicDup;
-	state.SequenceAck = gametic / TicDup;
-	state.CurrentNetConsistency = CurrentConsistency;
-	state.ConsistencyAck = CurrentConsistency;
-	state.LastVerifiedConsistency = CurrentConsistency;
+	const int lastSeq = max(gametic / TicDup - 1, -1);
+	const int lastCon = max(CurrentConsistency - 1, -1);
+	state.CurrentSequence = lastSeq;
+	state.SequenceAck = lastSeq;
+	state.CurrentNetConsistency = lastCon;
+	state.ConsistencyAck = lastCon;
+	state.LastVerifiedConsistency = lastCon;
 	state.Flags = CF_JOINING;
 	state.LastPacketReceivedTime = I_msTime();
 
@@ -1508,7 +1891,7 @@ static void AbortStateTransfer()
 		if (NetworkClients.InGame(client))
 		{
 			SendSetupPacketToClient(client, PRE_MIDGAME_STATE_ERROR);
-			ClientStates[client].Flags &= ~(CF_JOINING | CF_AWAITING_STATE);
+			ClientStates[client].Flags &= ~(CF_JOINING | CF_AWAITING_STATE | CF_AWAITING_ACTIVE);
 			DisconnectClient(client);
 		}
 
@@ -1713,9 +2096,14 @@ void HandleMidgameStateComplete()
 	auto& xfer = IncomingStateTransfer;
 	if (!xfer.active)
 	{
-		// We already loaded the snapshot and sent STATE_LOADED, but the host
-		// didn't receive it (packet loss). Resend so the host can proceed.
-		if (xfer.loadedSent)
+		// We already loaded the snapshot or processed the spawn locally, but
+		// the host may have missed our last setup packet. Resend so it can
+		// continue the join handshake.
+		if (xfer.activeSent)
+		{
+			SendMidgameStateActive();
+		}
+		else if (xfer.loadedSent)
 		{
 			uint8_t buf[2] = { NCMD_SETUP, PRE_MIDGAME_STATE_LOADED };
 			I_SendSetupPacket(Net_Arbitrator, buf, 2);
@@ -1758,7 +2146,7 @@ void HandleMidgameStateReady()
 	{
 		Printf("Client %d became ready while the host was transitioning, aborting join\n", joinerSlot);
 		SendSetupPacketToClient(joinerSlot, PRE_MIDGAME_STATE_ERROR);
-		ClientStates[joinerSlot].Flags &= ~(CF_JOINING | CF_AWAITING_STATE);
+		ClientStates[joinerSlot].Flags &= ~(CF_JOINING | CF_AWAITING_STATE | CF_AWAITING_ACTIVE);
 		DisconnectClient(joinerSlot);
 		return;
 	}
@@ -1790,7 +2178,7 @@ void HandleMidgameStateLoaded()
 	if (!PendingStateTransfer.active || joinerSlot != PendingStateTransfer.clientNum)
 		return;
 
-	Printf("Client %d loaded game state, spawning player\n", joinerSlot);
+	Printf("Client %d loaded game state, waiting for activation sync\n", joinerSlot);
 
 	// Notify all existing clients that a new player is joining.
 	uint8_t buf[MAX_MSGLEN];
@@ -1819,8 +2207,8 @@ void HandleMidgameStateLoaded()
 
 	// Inject DEM_MIDGAMESPAWN into the host's event stream.
 	// All nodes (host + existing clients + joiner) will process this at the
-	// same gametic via the lockstep protocol, deterministically spawning the
-	// new player's actor.
+	// same gametic via the lockstep protocol, deterministically aligning the
+	// new player's network state before the real spawn happens at activation.
 	Net_WriteInt8(DEM_MIDGAMESPAWN);
 	Net_WriteInt8(static_cast<uint8_t>(joinerSlot));
 
@@ -1830,13 +2218,48 @@ void HandleMidgameStateLoaded()
 	// where the joiner needs commands that would never be sent. Without this,
 	// the joiner stalls for seconds while the retransmission mechanism slowly
 	// fills the gap one round-trip at a time.
-	ClientStates[joinerSlot].ResendSequenceFrom = PendingStateTransfer.hostGametic / TicDup;
+	const int lastSeq = max(PendingStateTransfer.hostGametic / TicDup - 1, -1);
+	const int lastCon = max(PendingStateTransfer.hostConsistency - 1, -1);
+	auto& joinState = ClientStates[joinerSlot];
+	joinState.CurrentSequence = lastSeq;
+	joinState.SequenceAck = lastSeq;
+	joinState.ResendSequenceFrom = PendingStateTransfer.hostGametic / TicDup;
+	joinState.CurrentNetConsistency = lastCon;
+	joinState.ConsistencyAck = lastCon;
+	joinState.LastVerifiedConsistency = lastCon;
+	joinState.ResendConsistencyFrom = -1;
+	joinState.Flags &= ~(CF_MISSING | CF_RETRANSMIT);
 
 	// Clear CF_AWAITING_STATE so duplicate STATE_LOADED packets won't
-	// re-trigger before DEM_MIDGAMESPAWN clears CF_JOINING.
-	ClientStates[joinerSlot].Flags &= ~CF_AWAITING_STATE;
+	// re-trigger while we wait for the joiner's first live gameplay command.
+	joinState.Flags &= ~CF_AWAITING_STATE;
+	joinState.Flags |= CF_AWAITING_ACTIVE;
 
 	PendingStateTransfer.Clear();
+}
+
+// Host receives: STATE_ACTIVE from joiner. This confirms the joiner has
+// processed the pre-activation sync point locally and is ready for the
+// deterministic activation/spawn event from the current host tic.
+void HandleMidgameStateActive()
+{
+	if (consoleplayer != Net_Arbitrator)
+		return;
+
+	const int joinerSlot = RemoteClient;
+	if (joinerSlot < 0
+		|| !(ClientStates[joinerSlot].Flags & CF_JOINING)
+		|| !(ClientStates[joinerSlot].Flags & CF_AWAITING_ACTIVE))
+		return;
+
+	if (NetBufferLength >= 4)
+	{
+		TArrayView<uint8_t> stream = TArrayView(&NetBuffer[2], NetBufferLength - 2);
+		players[joinerSlot].MinPitch = DAngle::fromDeg(-ReadInt8(stream));
+		players[joinerSlot].MaxPitch = DAngle::fromDeg(ReadInt8(stream));
+	}
+
+	ConfirmMidgameJoinActive(joinerSlot);
 }
 
 // Host/Joiner receives: error during state transfer.
@@ -1872,16 +2295,20 @@ void Net_PrepareMidgameSync()
 
 	// Clear local commands so we don't replay stale input.
 	memset(LocalCmds, 0, sizeof(LocalCmds));
+	const int lastSeq = max(ClientTic - 1, -1);
+	const int lastCon = max(CurrentConsistency - 1, -1);
 
 	// Initialize our own client state.
 	auto& state = ClientStates[consoleplayer];
+	const int preservedFlags = state.Flags & (CF_QUIT | CF_JOINING | CF_AWAITING_STATE | CF_AWAITING_ACTIVE);
 	memset(&state, 0, sizeof(FClientNetState));
-	state.CurrentSequence = ClientTic;
-	state.SequenceAck = ClientTic;
-	state.CurrentNetConsistency = CurrentConsistency;
-	state.ConsistencyAck = CurrentConsistency;
-	state.LastVerifiedConsistency = CurrentConsistency;
+	state.CurrentSequence = lastSeq;
+	state.SequenceAck = lastSeq;
+	state.CurrentNetConsistency = lastCon;
+	state.ConsistencyAck = lastCon;
+	state.LastVerifiedConsistency = lastCon;
 	state.LastPacketReceivedTime = I_msTime();
+	state.Flags = preservedFlags;
 
 	// Initialize sequence and consistency tracking for all existing clients.
 	// Without this, stale CurrentSequence values from the pre-game lobby
@@ -1891,11 +2318,11 @@ void Net_PrepareMidgameSync()
 	{
 		if (c != consoleplayer)
 		{
-			ClientStates[c].CurrentSequence = ClientTic;
-			ClientStates[c].SequenceAck = ClientTic;
-			ClientStates[c].LastVerifiedConsistency = CurrentConsistency;
-			ClientStates[c].CurrentNetConsistency = CurrentConsistency;
-			ClientStates[c].ConsistencyAck = CurrentConsistency;
+			ClientStates[c].CurrentSequence = lastSeq;
+			ClientStates[c].SequenceAck = lastSeq;
+			ClientStates[c].LastVerifiedConsistency = lastCon;
+			ClientStates[c].CurrentNetConsistency = lastCon;
+			ClientStates[c].ConsistencyAck = lastCon;
 		}
 	}
 
@@ -2233,6 +2660,15 @@ static void GetPackets()
 				{
 					pState.CurrentSequence = seq;
 				}
+				// A late joiner may miss the side-channel STATE_ACTIVE packet on
+				// heavy maps, but once the host receives the joiner's first
+				// post-spawn command stream we know the client is fully active.
+				if (consoleplayer == Net_Arbitrator
+					&& clientNum == pNum
+					&& (clientState.Flags & CF_AWAITING_ACTIVE))
+				{
+					ConfirmMidgameJoinActive(clientNum);
+				}
 				// Update this so host switching doesn't have any hiccups.
 				if (consoleplayer != Net_Arbitrator && pNum != Net_Arbitrator)
 					pState.SequenceAck = seq;
@@ -2293,7 +2729,7 @@ static void CheckConsistencies()
 	// if the client's current position doesn't agree with the host.
 	for (auto client : NetworkClients)
 	{
-		if (!playeringame[client])
+		if (!playeringame[client] || IsDedicatedControlStream(client))
 			continue;
 
 		auto& clientState = ClientStates[client];
@@ -2349,6 +2785,9 @@ static uint32_t StaticSumSeeds()
 
 static int16_t CalculateConsistency(int client, uint32_t seed)
 {
+	if (IsDedicatedControlStream(client))
+		return 1;
+
 	if (players[client].mo != nullptr)
 	{
 		seed += int((players[client].mo->X() + players[client].mo->Y() + players[client].mo->Z()) * 257) + players[client].mo->Angles.Yaw.BAMs() + players[client].mo->Angles.Pitch.BAMs();
@@ -2358,7 +2797,6 @@ static int16_t CalculateConsistency(int client, uint32_t seed)
 	// Zero value consistencies are seen as invalid, so always have a valid value.
 	return (seed & 0xFFFF) ? seed : 1;
 }
-
 
 // Ran a tick, so prep the next consistencies to send out.
 // [RH] Include some random seeds and player stuff in the consistancy
@@ -2372,13 +2810,16 @@ static void MakeConsistencies()
 
 	for (auto client : NetworkClients)
 	{
-		if (!playeringame[client])
-			continue;
-		// Skip the ghost player on dedicated servers — it has no real input
-		// and its state is irrelevant to gameplay consistency.
-		if ((dedicatedServer || hostIsDedicated) && client == 0)
-			continue;
 		auto& clientState = ClientStates[client];
+		if (!playeringame[client])
+		{
+			if (clientState.Flags & (CF_JOINING | CF_AWAITING_STATE | CF_AWAITING_ACTIVE))
+			{
+				clientState.LocalConsistency[CurrentConsistency % BACKUPTICS] =
+					CalculatePendingJoinConsistency(client, rngSum);
+			}
+			continue;
+		}
 		clientState.LocalConsistency[CurrentConsistency % BACKUPTICS] = CalculateConsistency(client, rngSum);
 	}
 
@@ -2565,7 +3006,7 @@ void NetUpdate(int tics)
 						&& (now - state.LastPacketReceivedTime) >= STATE_TRANSFER_TOTAL_TIMEOUT_MS)
 					{
 						Printf("Joining client %d timed out (state transfer never started)\n", client);
-						ClientStates[client].Flags &= ~(CF_JOINING | CF_AWAITING_STATE);
+						ClientStates[client].Flags &= ~(CF_JOINING | CF_AWAITING_STATE | CF_AWAITING_ACTIVE);
 						DisconnectClient(client);
 					}
 					continue;
@@ -2655,15 +3096,24 @@ void NetUpdate(int tics)
 			continue;
 		}
 
-		if (dedicatedServer)
-		{
-			// Dedicated server generates empty commands — no input, no actor.
-			memset(&LocalCmds[ClientTic++ % LOCALCMDTICS], 0, sizeof(usercmd_t));
-		}
-		else
-		{
-			G_BuildTiccmd(&LocalCmds[ClientTic++ % LOCALCMDTICS]);
-		}
+			if (dedicatedServer)
+			{
+				// Dedicated server generates empty commands — no input, no actor.
+				memset(&LocalCmds[ClientTic++ % LOCALCMDTICS], 0, sizeof(usercmd_t));
+			}
+			else if (ShouldSuppressMidgameJoinLocalCommands())
+			{
+				// Keep consuming remote tics so DEM_MIDGAMESPAWN and
+				// DEM_MIDGAMEACTIVE can execute, but do not generate or send local
+				// gameplay commands before the joiner is officially activated.
+				continue;
+			}
+			else
+			{
+				const int localTic = ClientTic++;
+				auto& built = LocalCmds[localTic % LOCALCMDTICS];
+				G_BuildTiccmd(&built);
+			}
 		if (TicDup == 1)
 		{
 			Net_NewClientTic();
@@ -2738,6 +3188,15 @@ void NetUpdate(int tics)
 		for (auto client : NetworkClients)
 			ClientStates[client].CurrentSequence = newestTic;
 
+		return;
+	}
+
+	// While waiting for DEM_MIDGAMESPAWN, the late joiner should only
+	// receive host data. Sending normal gameplay packets here just echoes the
+	// host stream back and confuses retransmit bookkeeping.
+	if (ShouldSuppressMidgameJoinLocalCommands())
+	{
+		GetPackets();
 		return;
 	}
 
@@ -2926,7 +3385,6 @@ void NetUpdate(int tics)
 					if (curState.ResendSequenceFrom >= endSequence)
 						curState.ResendSequenceFrom = -1;
 				}
-
 				NetBuffer[size++] = sendTics;
 				if (sendTics > 0)
 				{
@@ -3228,7 +3686,7 @@ bool D_CheckNetGame()
 	const uint64_t startTime = I_msTime();
 	for (auto client : NetworkClients)
 	{
-		// Mid-game joiner: skip our own slot — we enter via DEM_MIDGAMESPAWN later.
+		// Mid-game joiner: skip our own slot — we enter via DEM_MIDGAMEACTIVE later.
 		if (gameaction == ga_midgamejoin && client == consoleplayer)
 			continue;
 
@@ -3471,6 +3929,13 @@ ADD_STAT(network)
 		consoleplayer == Net_Arbitrator,
 		delay, msDelay,
 		buffer, msBuffer);
+	out.AppendFormat("\tInput lag now/avg/max: %02d/%02d/%02d (%03d/%03d/%03dms)",
+		LocalInputLagHistory.Current(),
+		LocalInputLagHistory.Average(),
+		LocalInputLagHistory.Max,
+		SeqTicsToMs(LocalInputLagHistory.Current()),
+		SeqTicsToMs(LocalInputLagHistory.Average()),
+		SeqTicsToMs(LocalInputLagHistory.Max));
 
 	if (consoleplayer != Net_Arbitrator)
 		out.AppendFormat("\tAvg latency: %03ums", min<unsigned int>(ClientStates[consoleplayer].AverageLatency, 999u));
@@ -3485,19 +3950,35 @@ ADD_STAT(network)
 			out.AppendFormat("\tWaiting for arbitrator");
 	}
 
-	int lowestSeq = ClientTic / TicDup;
+	const int newestSeq = ClientTic / TicDup;
+	int lowestSeq = newestSeq;
 	for (auto client : NetworkClients)
 	{
 		if (client == consoleplayer)
 			continue;
 
 		auto& state = ClientStates[client];
-		if (state.CurrentSequence < lowestSeq)
-			lowestSeq = state.CurrentSequence;
+		if (!IsTrackableClientForLagStats(client))
+			continue;
+		const int seq = GetDisplayedClientSequenceForLagStats(client, newestSeq);
+		if (seq < lowestSeq)
+			lowestSeq = seq;
+	}
+
+	for (auto client : NetworkClients)
+	{
+		if (client == consoleplayer)
+			continue;
+
+		auto& state = ClientStates[client];
+		const bool tracked = IsTrackableClientForLagStats(client);
+		const int seq = tracked ? GetDisplayedClientSequenceForLagStats(client, newestSeq) : state.CurrentSequence;
 
 		out.AppendFormat("\n%s", players[client].userinfo.GetName(12));
 		if (client == Net_Arbitrator)
-			out.AppendFormat("\t(Host)");
+			out.AppendFormat(IsDedicatedControlStream(client) ? "\t(Host Ctrl)" : "\t(Host)");
+		if (tracked && seq == lowestSeq)
+			out.AppendFormat("\t(Gate)");
 
 		if ((state.Flags & CF_RETRANSMIT) == CF_RETRANSMIT)
 			out.AppendFormat("\t(RT)");
@@ -3515,7 +3996,18 @@ ADD_STAT(network)
 
 		out.AppendFormat("\n");
 		
-		out.AppendFormat("\tAck: %06d\tConsistency: %06d", state.SequenceAck, state.ConsistencyAck);
+		out.AppendFormat("\tSeq: %06d\tAck: %06d\tConsistency: %06d",
+			seq, state.SequenceAck, state.ConsistencyAck);
+		if (tracked)
+		{
+			out.AppendFormat("\tBehind now/avg/max: %02d/%02d/%02d (%03d/%03d/%03dms)",
+				StreamBehindHistory[client].Current(),
+				StreamBehindHistory[client].Average(),
+				StreamBehindHistory[client].Max,
+				SeqTicsToMs(StreamBehindHistory[client].Current()),
+				SeqTicsToMs(StreamBehindHistory[client].Average()),
+				SeqTicsToMs(StreamBehindHistory[client].Max));
+		}
 		if (client != Net_Arbitrator)
 			out.AppendFormat("\tAvg latency: %03ums", min<unsigned int>(state.AverageLatency, 999u));
 	}
@@ -3623,6 +4115,11 @@ void TryRunTics()
 {
 	GC::CheckGC();
 
+	auto shouldHibernateNow = [&]()
+	{
+		return ShouldHibernateDedicatedServer();
+	};
+
 	if (ToggleFullscreen)
 	{
 		ToggleFullscreen = false;
@@ -3648,27 +4145,48 @@ void TryRunTics()
 	if (totalTics > 1 && singletics)
 		totalTics = 1;
 
+	// If the joiner already spawned locally but the host has not yet confirmed
+	// activation, keep nudging the host with STATE_ACTIVE. The confirmation
+	// comes back as DEM_MIDGAMEACTIVE through the normal lockstep stream.
+	ResendMidgameStateActiveIfNeeded();
+
+	// A dedicated server with no real players should stay packet-responsive
+	// but must not advance local command generation while hibernating.
+	if (shouldHibernateNow())
+	{
+		NetUpdate(0);
+		LastEnterTic = EnterTic;
+
+		if (pauseext)
+			return;
+
+		if (shouldHibernateNow())
+		{
+			LastGameUpdate = EnterTic;
+			LagState = LAG_NONE;
+			for (auto client : NetworkClients)
+				players[client].waiting = false;
+			return;
+		}
+	}
+
+	// While the snapshot is still being transferred/loaded, the joiner cannot
+	// participate in the lockstep yet.
+	if (gameaction == ga_midgamejoin)
+	{
+		NetUpdate(0);
+
+		G_DoMidgameJoin();
+
+		LastEnterTic = EnterTic;
+		return;
+	}
+
 	// Listen for other clients and send out data as needed. This is also
 	// needed for singleplayer! But is instead handled entirely through local
 	// buffers. This has a limit of one seconds worth of commands that can be
 	// generated in advanced from the last time the game updated.
 	NetUpdate(totalTics);
-
-	// Mid-game join: process state transfer outside the lockstep. The joining
-	// client is blocked at tics=0 because it has no commands from the host yet.
-	// G_DoMidgameJoin only does I/O (request state, receive chunks, load snapshot)
-	// — the actual player spawn goes through DEM_MIDGAMESPAWN via the lockstep.
-	if (gameaction == ga_midgamejoin)
-	{
-		G_DoMidgameJoin();
-		// Keep LastEnterTic current so that when ga_midgamejoin clears,
-		// the next TryRunTics doesn't see a huge totalTics burst.
-		// Without this, NetUpdate generates hundreds of commands at once
-		// but MAXSENDTICS only sends 35 — the rest are never sent,
-		// creating a gap that freezes the host after exactly 35 tics.
-		LastEnterTic = EnterTic;
-		return;
-	}
 
 	LastEnterTic = EnterTic;
 
@@ -3676,11 +4194,27 @@ void TryRunTics()
 	if (pauseext)
 		return;
 
+	if (shouldHibernateNow())
+	{
+		LastGameUpdate = EnterTic;
+		LagState = LAG_NONE;
+		for (auto client : NetworkClients)
+			players[client].waiting = false;
+		return;
+	}
+
 	// Get the amount of tics the client can actually run. This accounts for waiting for other
 	// players over the network.
 	int lowestSequence = INT_MAX;
 	for (auto client : NetworkClients)
 	{
+		// A waiting late-joiner has no local gameplay command stream yet.
+		// If we include its own slot here, lowestSequence gets pinned to the
+		// snapshot baseline and the client never advances far enough to
+		// execute DEM_MIDGAMESPAWN from the host event stream.
+		if (ShouldSuppressMidgameJoinLocalCommands() && client == consoleplayer)
+			continue;
+
 		// Skip joining clients — they have no commands yet and would block the lockstep.
 		// Skip quitting clients — they stopped sending commands and will be removed by
 		// NCMD_QUITTERS (network) + DEM_PLAYERDISCONNECT (game state) shortly.
@@ -3726,6 +4260,8 @@ void TryRunTics()
 		if (totalTics < availableTics - StabilityBuffer)
 			++runTics;
 	}
+
+	SampleNetLagHistories();
 
 	const int worldTimer = primaryLevel->LocalWorldTimer;
 	// If there are no tics to run, check for possible stall conditions and new
@@ -4651,10 +5187,6 @@ void Net_DoCommand(int cmd, TArrayView<uint8_t>& stream, int player)
 		const int pnum = ReadInt8(stream);
 		if (pnum >= 0 && pnum < (int)MAXPLAYERS && !playeringame[pnum])
 		{
-			playeringame[pnum] = true;
-			players[pnum].playerstate = PST_ENTER;
-			// Clear the joining flags now that they're officially in the game.
-			ClientStates[pnum].Flags &= ~(CF_JOINING | CF_AWAITING_STATE);
 			// Synchronize the joiner's command sequence to the current gametic
 			// on ALL nodes. ClientConnecting set CurrentSequence at CONNECT time
 			// (before V_Init2/state transfer), so it's now stale by hundreds of
@@ -4662,40 +5194,81 @@ void Net_DoCommand(int cmd, TArrayView<uint8_t>& stream, int player)
 			// in TryRunTics, freezing the entire lockstep until the joiner's
 			// actual commands catch up — causing a multi-second freeze for all
 			// clients and subsequent input lag from command pileup.
-			ClientStates[pnum].CurrentSequence = gametic / TicDup;
-			ClientStates[pnum].SequenceAck = gametic / TicDup;
+			const int lastSeq = max(gametic / TicDup - 1, -1);
+			const int lastCon = max(CurrentConsistency - 1, -1);
+			ClientStates[pnum].CurrentSequence = lastSeq;
+			ClientStates[pnum].SequenceAck = lastSeq;
 			// Initialize consistency tracking for the new player on all nodes,
-			// and for all existing players on the joiner's node. Without this,
-			// stale circular buffer entries would cause false desyncs.
-			ClientStates[pnum].LastVerifiedConsistency = CurrentConsistency;
-			ClientStates[pnum].CurrentNetConsistency = CurrentConsistency;
-			ClientStates[pnum].ConsistencyAck = CurrentConsistency;
+			// using the last completed world tic. The packet carrying
+			// DEM_MIDGAMESPAWN may already have advanced the existing streams to
+			// the first post-snapshot tic, so do not overwrite those here.
+			ClientStates[pnum].LastVerifiedConsistency = lastCon;
+			ClientStates[pnum].CurrentNetConsistency = lastCon;
+			ClientStates[pnum].ConsistencyAck = lastCon;
+
+			// On the joiner's node, this is now just the catch-up barrier:
+			// the snapshot world is already renderable, but the real pawn is not
+			// spawned until DEM_MIDGAMEACTIVE. That avoids exposing a helpless
+			// player to gameplay during the activation handshake.
 			if (pnum == consoleplayer)
 			{
-				// This is the joiner processing its own spawn. Initialize
-				// consistency tracking for all existing clients too.
-				for (auto c : NetworkClients)
-				{
-					if (c != pnum)
-					{
-						ClientStates[c].LastVerifiedConsistency = CurrentConsistency;
-						ClientStates[c].CurrentNetConsistency = CurrentConsistency;
-						ClientStates[c].ConsistencyAck = CurrentConsistency;
-					}
-				}
-			}
-			// Immediately spawn the player via DoReborn to avoid P_PlayerThink
-			// seeing a null mo before the next G_Ticker spawn loop runs.
-			primaryLevel->DoReborn(pnum, true);
-			// On the joiner's node, clear stale prediction data so the first
-			// P_PredictClient call starts fresh with the newly spawned actor.
-			if (pnum == consoleplayer)
-			{
-				P_ClearPredictionData();
+				G_ApplyRendererPitchLimitsToPlayer(pnum);
 				IncomingStateTransfer.loadedSent = false;
+				IncomingStateTransfer.activeSent = true;
+				SendMidgameStateActive();
 			}
-			// RNG state is synchronized via full serialization in the state
-			// transfer (globals portion). No seed-based reset needed.
+		}
+		break;
+	}
+
+	case DEM_MIDGAMEACTIVE:
+	{
+		const int pnum = ReadInt8(stream);
+		if (pnum >= 0 && pnum < (int)MAXPLAYERS)
+		{
+			auto& netState = ClientStates[pnum];
+			const DAngle minPitch = DAngle::fromDeg(-ReadInt8(stream));
+			const DAngle maxPitch = DAngle::fromDeg(ReadInt8(stream));
+			const int lastSeq = max(gametic / TicDup - 1, 0);
+			const int lastCon = max(CurrentConsistency - 1, 0);
+			if (!playeringame[pnum])
+			{
+				playeringame[pnum] = true;
+				players[pnum].playerstate = PST_ENTER;
+				primaryLevel->DoReborn(pnum, true);
+			}
+			players[pnum].MinPitch = minPitch;
+			players[pnum].MaxPitch = maxPitch;
+			// Activation is the first moment this player is truly live.
+			// Existing clients must advance the slot's stream baseline here too,
+			// otherwise lowestSequence gets pinned by the stale pre-activation
+			// sequence and everyone stalls waiting on a stream that should now
+			// start from the live activation point.
+			netState.CurrentSequence = max(netState.CurrentSequence, lastSeq);
+			netState.SequenceAck = max(netState.SequenceAck, netState.CurrentSequence);
+			netState.CurrentNetConsistency = max(netState.CurrentNetConsistency, lastCon);
+			netState.ConsistencyAck = max(netState.ConsistencyAck, netState.CurrentNetConsistency);
+			netState.LastVerifiedConsistency = max(netState.LastVerifiedConsistency, netState.CurrentNetConsistency);
+			netState.ResendSequenceFrom = -1;
+			netState.ResendConsistencyFrom = -1;
+			netState.Flags &= ~(CF_JOINING | CF_AWAITING_STATE | CF_AWAITING_ACTIVE | CF_MISSING | CF_RETRANSMIT);
+			if (pnum == consoleplayer)
+			{
+				const int nextClientTic = ((gametic / TicDup) + 1) * TicDup;
+				if (ClientTic < nextClientTic)
+					ClientTic = nextClientTic;
+				memset(LocalCmds, 0, sizeof(LocalCmds));
+				NetEvents.ResetStream();
+				SkipCommandTimer = SkipCommandAmount = CommandsAhead = 0;
+				netState.CurrentSequence = max(ClientTic / TicDup - 1, 0);
+				netState.SequenceAck = netState.CurrentSequence;
+				netState.CurrentNetConsistency = lastCon;
+				netState.ConsistencyAck = netState.CurrentNetConsistency;
+				netState.LastVerifiedConsistency = netState.CurrentNetConsistency;
+				G_ClearMidgameJoinRenderState();
+				P_ClearPredictionData();
+				IncomingStateTransfer.activeSent = false;
+			}
 			Printf("Player %d has joined the game\n", pnum + 1);
 		}
 		break;
@@ -4820,6 +5393,7 @@ void Net_SkipCommand(int cmd, TArrayView<uint8_t>& stream)
 		case DEM_KICK:
 		case DEM_WEAPSELECT:
 		case DEM_MIDGAMESPAWN:
+		case DEM_MIDGAMEACTIVE:
 		case DEM_PLAYERDISCONNECT:
 			skip = 1;
 			break;
@@ -4986,6 +5560,19 @@ CCMD(pings)
 		if (client != Net_Arbitrator)
 			Printf("%ums %s [%d]\n", ClientStates[client].AverageLatency, players[client].userinfo.GetName(), client);
 	}
+}
+
+CCMD(netlagreset)
+{
+	ResetNetLagHistories();
+	Printf("Network lag metrics reset.\n");
+	if (net_lagdump)
+		Printf("Dump file reset: %s\n", GetNetLagDumpPath().GetChars());
+}
+
+CCMD(netlagdumpfile)
+{
+	Printf("%s\n", GetNetLagDumpPath().GetChars());
 }
 
 CCMD(kick)

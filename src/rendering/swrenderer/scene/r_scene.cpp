@@ -84,6 +84,10 @@ namespace swrenderer
 
 	void RenderScene::RenderView(player_t *player, DCanvas *target, void *videobuffer, int bufferpitch)
 	{
+		auto viewactor = player->mo != nullptr ? player->mo : player->camera;
+		if (viewactor == nullptr || player->camera == nullptr)
+			return;
+
 		auto viewport = MainThread()->Viewport.get();
 		viewport->RenderTarget = target;
 		viewport->RenderingToCanvas = false;
@@ -113,7 +117,7 @@ namespace swrenderer
 			}
 		}
 
-		RenderActorView(player->mo, true, false);
+		RenderActorView(viewactor, true, false);
 
 		if (videobuffer != target->GetPixels())
 		{

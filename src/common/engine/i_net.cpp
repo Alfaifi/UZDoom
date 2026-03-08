@@ -197,6 +197,7 @@ extern void HandleMidgameStateChunkAck();
 extern void HandleMidgameStateComplete();
 extern void HandleMidgameStateReady();
 extern void HandleMidgameStateLoaded();
+extern void HandleMidgameStateActive();
 extern void HandleMidgameStateError();
 
 CUSTOM_CVAR(String, net_password, "", CVAR_IGNORE)
@@ -957,6 +958,10 @@ void HandleIncomingConnection()
 	case PRE_MIDGAME_STATE_LOADED:
 		if (RemoteClient >= 0)
 			HandleMidgameStateLoaded();
+		return;
+	case PRE_MIDGAME_STATE_ACTIVE:
+		if (RemoteClient >= 0)
+			HandleMidgameStateActive();
 		return;
 	case PRE_MIDGAME_STATE_ERROR:
 		if (RemoteClient >= 0)

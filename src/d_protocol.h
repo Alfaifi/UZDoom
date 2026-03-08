@@ -162,8 +162,9 @@ enum EDemoCommand
 	DEM_READIED,		// 77
 	DEM_WEAPSELECT,		// 78 Byte: Slot
 	DEM_USEFLECHETTE,	// 79
-	DEM_MIDGAMESPAWN,	// 80 Byte: Player number to spawn mid-game
+	DEM_MIDGAMESPAWN,	// 80 Byte: Player number pre-activation sync point
 	DEM_PLAYERDISCONNECT,	// 81 Byte: Player number to remove deterministically
+	DEM_MIDGAMEACTIVE,	// 82 Byte: Player number is fully active and spawned
 };
 
 // The following are implemented by cht_DoCheat in m_cheat.cpp

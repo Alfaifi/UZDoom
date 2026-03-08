@@ -160,6 +160,7 @@ enum ENetConnectType : uint8_t
 	PRE_MIDGAME_STATE_COMPLETE,	// Host -> Joiner: all chunks sent
 	PRE_MIDGAME_STATE_READY,	// Joiner -> Host: initialized, ready for state
 	PRE_MIDGAME_STATE_LOADED,	// Joiner -> Host: snapshot loaded successfully
+	PRE_MIDGAME_STATE_ACTIVE,	// Joiner -> Host: pre-activation sync processed locally
 	PRE_MIDGAME_STATE_ERROR,	// Joiner -> Host: error, abort transfer
 };
 

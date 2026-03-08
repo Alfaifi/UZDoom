@@ -49,6 +49,7 @@ enum EClientFlags
 	CF_DISCONNECT_NOTIFIED = 1 << 7,	// Host has notified others about this client's departure.
 	CF_JOINING = 1 << 8,				// Client is in the process of joining mid-game.
 	CF_AWAITING_STATE = 1 << 9,			// Client is waiting for game state transfer.
+	CF_AWAITING_ACTIVE = 1 << 10,		// Host is waiting for the joiner to confirm the pre-activation sync point.
 
 	CF_RETRANSMIT = CF_RETRANSMIT_CON | CF_RETRANSMIT_SEQ,
 	CF_MISSING = CF_MISSING_CON | CF_MISSING_SEQ,
@@ -163,6 +164,7 @@ double Net_ModifyParticleFrac(particle_t* part, double ticFrac);
 
 // True on clients connected to a dedicated server (host player 0 is a ghost).
 extern bool					hostIsDedicated;
+bool						Net_IsGhostPlayer(int player);
 
 // Netgame stuff (buffers and pointers, i.e. indices).
 
@@ -222,10 +224,13 @@ void HandleMidgameStateBegin();
 void HandleMidgameStateChunk();
 void HandleMidgameStateChunkAck();
 void HandleMidgameStateComplete();
+void HandleMidgameStateReady();
 void HandleMidgameStateLoaded();
+void HandleMidgameStateActive();
 void HandleMidgameStateError();
 
 void Net_PrepareMidgameSync();
+bool Net_ShouldSuppressMidgameJoinInput();
 extern struct FStateTransferRecv IncomingStateTransfer;
 
 // Chunk size for mid-game state transfer (fits in MaxTransmitSize after headers + compression).
@@ -259,6 +264,7 @@ struct FStateTransferRecv
 {
 	bool		active = false;
 	bool		loadedSent = false;	// True after STATE_LOADED was sent to host
+	bool		activeSent = false;	// True after STATE_ACTIVE was sent to host
 	TArray<uint8_t>	data;			// Reassembly buffer
 	size_t		totalSize = 0;
 	size_t		globalsSize = 0;

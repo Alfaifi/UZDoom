@@ -2057,6 +2057,28 @@ void G_SerializeMidgameGlobalsPostInit(FSerializer& arc)
 	}
 }
 
+void G_ApplyRendererPitchLimitsToPlayer(int player)
+{
+	if (player < 0 || player >= (int)MAXPLAYERS)
+		return;
+
+	int uppitch, downpitch;
+	if (!V_IsHardwareRenderer())
+	{
+		int maxvp = min(56, (int)maxviewpitch);
+		int maxup = min(32, (int)maxviewpitch);
+		uppitch = cl_oldfreelooklimit ? maxup : maxvp;
+		downpitch = maxvp;
+	}
+	else
+	{
+		uppitch = downpitch = (int)maxviewpitch;
+	}
+
+	players[player].MinPitch = DAngle::fromDeg(-(double)uppitch);
+	players[player].MaxPitch = DAngle::fromDeg((double)downpitch);
+}
+
 
 void SetupLoadingCVars();
 void FinishLoadingCVars();
@@ -2073,12 +2095,66 @@ bool CheckGZDoomSaveCompat(FString &engine, FString &software);
 
 static bool bMidgameStateRequested = false;
 static uint64_t midgameJoinStartTime = 0;
+static bool bMidgameJoinRenderReady = false;
+static constexpr int MaxPlayersInt = (int)MAXPLAYERS;
+
+static AActor* PickMidgameJoinRenderCamera()
+{
+	if (consoleplayer >= 0 && consoleplayer < MaxPlayersInt && players[consoleplayer].mo != nullptr)
+		return players[consoleplayer].mo;
+
+	AActor* ghostFallback = nullptr;
+
+	for (int i = 0; i < MaxPlayersInt; ++i)
+	{
+		if (!playeringame[i])
+			continue;
+
+		if (Net_IsGhostPlayer(i))
+		{
+			if (ghostFallback == nullptr)
+				ghostFallback = players[i].mo != nullptr ? players[i].mo : players[i].camera;
+			continue;
+		}
+
+		if (players[i].mo != nullptr)
+			return players[i].mo;
+		if (players[i].camera != nullptr)
+			return players[i].camera;
+	}
+
+	return ghostFallback;
+}
+
+bool G_CanRenderMidgameJoinView()
+{
+	return gamestate == GS_LEVEL
+		&& consoleplayer >= 0
+		&& consoleplayer < MaxPlayersInt
+		&& !playeringame[consoleplayer]
+		&& bMidgameJoinRenderReady
+		&& players[consoleplayer].camera != nullptr;
+}
+
+void G_ClearMidgameJoinRenderState()
+{
+	bMidgameJoinRenderReady = false;
+
+	if (consoleplayer < 0 || consoleplayer >= MaxPlayersInt)
+		return;
+
+	if (playeringame[consoleplayer] && players[consoleplayer].mo != nullptr)
+		players[consoleplayer].camera = players[consoleplayer].mo;
+	else
+		players[consoleplayer].camera = nullptr;
+}
 
 void G_AbortMidgameJoin()
 {
 	gameaction = ga_fullconsole;
 	bMidgameStateRequested = false;
 	midgameJoinStartTime = 0;
+	G_ClearMidgameJoinRenderState();
 	IncomingStateTransfer.Clear();
 }
 
@@ -2201,6 +2277,7 @@ void G_DoMidgameJoin()
 	// The joiner is NOT in the game yet — their slot will be activated via
 	// DEM_MIDGAMESPAWN after we signal STATE_LOADED.
 	playeringame[consoleplayer] = false;
+	G_ClearMidgameJoinRenderState();
 
 	// Load the map with the snapshot. Setting savegamerestore triggers
 	// UnSnapshotLevel() inside G_InitNew(). Note: G_InitNew calls
@@ -2240,27 +2317,9 @@ void G_DoMidgameJoin()
 	// DEM_SETPITCHLIMIT from each player's console). For a mid-game joiner,
 	// remote players never re-send their pitch limits, so fix them now using
 	// the local renderer's pitch range.
+	for (size_t i = 0; i < MAXPLAYERS; ++i)
 	{
-		int uppitch, downpitch;
-		if (!V_IsHardwareRenderer())
-		{
-			int maxvp = min(56, (int)maxviewpitch);
-			int maxup = min(32, (int)maxviewpitch);
-			uppitch = cl_oldfreelooklimit ? maxup : maxvp;
-			downpitch = maxvp;
-		}
-		else
-		{
-			uppitch = downpitch = (int)maxviewpitch;
-		}
-		for (size_t i = 0; i < MAXPLAYERS; ++i)
-		{
-			if (playeringame[i] && players[i].mo)
-			{
-				players[i].MinPitch = DAngle::fromDeg(-(double)uppitch);
-				players[i].MaxPitch = DAngle::fromDeg((double)downpitch);
-			}
-		}
+		G_ApplyRendererPitchLimitsToPlayer((int)i);
 	}
 
 	if (globalsSize > 0)
@@ -2273,6 +2332,11 @@ void G_DoMidgameJoin()
 
 	// Synchronize network state with the host.
 	Net_PrepareMidgameSync();
+
+	// The late joiner is still not gameplay-active, but the snapshot world is
+	// loaded and can be rendered locally while waiting for DEM_MIDGAMESPAWN.
+	players[consoleplayer].camera = PickMidgameJoinRenderCamera();
+	bMidgameJoinRenderReady = (players[consoleplayer].camera != nullptr);
 
 	// Signal to the host that we've loaded successfully.
 	xfer.loadedSent = true;
