@@ -5224,11 +5224,11 @@ void Net_DoCommand(int cmd, TArrayView<uint8_t>& stream, int player)
 	case DEM_MIDGAMEACTIVE:
 	{
 		const int pnum = ReadInt8(stream);
+		const DAngle minPitch = DAngle::fromDeg(-ReadInt8(stream));
+		const DAngle maxPitch = DAngle::fromDeg(ReadInt8(stream));
 		if (pnum >= 0 && pnum < (int)MAXPLAYERS)
 		{
 			auto& netState = ClientStates[pnum];
-			const DAngle minPitch = DAngle::fromDeg(-ReadInt8(stream));
-			const DAngle maxPitch = DAngle::fromDeg(ReadInt8(stream));
 			const int lastSeq = max(gametic / TicDup - 1, 0);
 			const int lastCon = max(CurrentConsistency - 1, 0);
 			if (!playeringame[pnum])
@@ -5393,9 +5393,12 @@ void Net_SkipCommand(int cmd, TArrayView<uint8_t>& stream)
 		case DEM_KICK:
 		case DEM_WEAPSELECT:
 		case DEM_MIDGAMESPAWN:
-		case DEM_MIDGAMEACTIVE:
 		case DEM_PLAYERDISCONNECT:
 			skip = 1;
+			break;
+
+		case DEM_MIDGAMEACTIVE:
+			skip = 3;
 			break;
 
 		case DEM_SAVEGAME:
